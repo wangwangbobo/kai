@@ -1472,6 +1472,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 remaining = lockout_attempts - get_failure_count()
                 await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
             return
+
+        # Auth is still valid - refresh the timestamp so the session
+        # timeout measures inactivity, not time since login.
+        context.user_data["totp_authenticated_at"] = time.time()
     # ── End TOTP gate ─────────────────────────────────────────────────────
 
     chat_id = _chat_id(update)
@@ -1555,50 +1559,53 @@ async def _handle_response(
     last_edit_text = ""
     final_response = None
 
-    # Reset the stop event (in case /stop was sent between messages)
-    stop_event = get_stop_event(chat_id)
-    stop_event.clear()
-
-    # Stream events from Claude
-    async for event in claude.send(prompt):
-        # Check for /stop between stream chunks
-        if stop_event.is_set():
-            stop_event.clear()
-            if live_msg:
-                await _edit_message_safe(live_msg, last_edit_text + "\n\n_(stopped)_")
-            final_response = None
-            break
-
-        if event.done:
-            final_response = event.response
-            break
-
-        # In voice-only mode, skip live text updates
-        if voice_only:
-            continue
-
-        now = time.monotonic()
-        if not event.text_so_far:
-            continue
-
-        # Create the live message on first text, then edit periodically
-        if live_msg is None:
-            truncated = _truncate_for_telegram(event.text_so_far)
-            live_msg = await _reply_safe(update.message, truncated)
-            last_edit_time = now
-            last_edit_text = event.text_so_far
-        elif now - last_edit_time >= EDIT_INTERVAL and event.text_so_far != last_edit_text:
-            await _edit_message_safe(live_msg, event.text_so_far)
-            last_edit_time = now
-            last_edit_text = event.text_so_far
-
-    # Stop the typing indicator
-    typing_active = False
-    typing_task.cancel()
     try:
-        await typing_task
-    except asyncio.CancelledError:
-        pass
+        # Reset the stop event (in case /stop was sent between messages)
+        stop_event = get_stop_event(chat_id)
+        stop_event.clear()
+
+        # Stream events from Claude
+        async for event in claude.send(prompt):
+            # Check for /stop between stream chunks
+            if stop_event.is_set():
+                stop_event.clear()
+                if live_msg:
+                    await _edit_message_safe(live_msg, last_edit_text + "\n\n_(stopped)_")
+                final_response = None
+                break
+
+            if event.done:
+                final_response = event.response
+                break
+
+            # In voice-only mode, skip live text updates
+            if voice_only:
+                continue
+
+            now = time.monotonic()
+            if not event.text_so_far:
+                continue
+
+            # Create the live message on first text, then edit periodically
+            if live_msg is None:
+                truncated = _truncate_for_telegram(event.text_so_far)
+                live_msg = await _reply_safe(update.message, truncated)
+                last_edit_time = now
+                last_edit_text = event.text_so_far
+            elif now - last_edit_time >= EDIT_INTERVAL and event.text_so_far != last_edit_text:
+                await _edit_message_safe(live_msg, event.text_so_far)
+                last_edit_time = now
+                last_edit_text = event.text_so_far
+    finally:
+        # Always cancel the typing indicator, even if the streaming loop
+        # exits with an exception. Without this, a leaked _keep_typing task
+        # sends typing indicators to the chat indefinitely.
+        typing_active = False
+        typing_task.cancel()
+        try:
+            await typing_task
+        except asyncio.CancelledError:
+            pass
 
     # Handle error cases
     if final_response is None:
