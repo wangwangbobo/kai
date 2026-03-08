@@ -244,8 +244,7 @@ def load_services(config_path: Path) -> dict[str, ServiceDef]:
     try:
         raw = yaml.safe_load(config_path.read_text())
     except yaml.YAMLError as e:
-        log.critical("Invalid YAML in %s: %s", config_path, e)
-        raise SystemExit(1) from e
+        raise SystemExit(f"Invalid YAML in {config_path}: {e}") from e
 
     return _load_and_register(raw)
 
@@ -269,8 +268,7 @@ def load_services_from_string(text: str) -> dict[str, ServiceDef]:
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as e:
-        log.critical("Invalid YAML in protected services config: %s", e)
-        raise SystemExit(1) from e
+        raise SystemExit(f"Invalid YAML in protected services config: {e}") from e
 
     return _load_and_register(raw)
 
@@ -366,6 +364,16 @@ async def call_service(
     if api_key and svc.auth.type == "query" and svc.auth.name:
         merged_params[svc.auth.name] = api_key
 
+    # Validate path_suffix to prevent request smuggling via crafted paths.
+    # Reject query strings, fragments, and path traversal segments. Note:
+    # full URLs as path_suffix are valid (e.g., Jina Reader uses
+    # path_suffix="https://example.com" appended to "https://r.jina.ai/").
+    if path_suffix:
+        if "?" in path_suffix or "#" in path_suffix:
+            return ServiceResponse(success=False, error="path_suffix must not contain query string or fragment")
+        if "/.." in path_suffix or path_suffix.startswith(".."):
+            return ServiceResponse(success=False, error="path_suffix must not contain '..' segments")
+
     # Construct the full URL (base + optional path suffix)
     url = svc.url + path_suffix
 
@@ -381,7 +389,9 @@ async def call_service(
                 url=url,
                 headers=headers,
                 params=merged_params if merged_params else None,
-                json=body if body else None,
+                # Use `is not None` so an empty dict {} is sent as an empty JSON
+                # object rather than being treated as "no body"
+                json=body if body is not None else None,
                 timeout=timeout,
             ) as resp:
                 response_body = await resp.text()

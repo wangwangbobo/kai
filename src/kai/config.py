@@ -20,6 +20,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+log = logging.getLogger(__name__)
+
+
+# ── Module-level paths and constants ─────────────────────────────────
+
 # Derive project root from file location: src/kai/config.py -> src/kai -> src -> project root.
 # In a pip-installed deployment (e.g., /opt/kai/venv/lib/.../site-packages/kai/), this
 # resolves to site-packages/ instead of the install root. KAI_INSTALL_DIR overrides it.
@@ -31,6 +36,17 @@ PROJECT_ROOT = Path(os.environ.get("KAI_INSTALL_DIR") or str(_FILE_ROOT))
 # source lives in read-only /opt/kai/, this points to user-owned /var/lib/kai/.
 # Uses `or` so that an empty string also falls back (same pattern as CLAUDE_USER).
 DATA_DIR = Path(os.environ.get("KAI_DATA_DIR") or str(PROJECT_ROOT))
+
+# Single source of truth for valid Claude model names.
+# install.py and bot.py both reference this instead of maintaining their own lists.
+VALID_MODELS = {"haiku", "sonnet", "opus"}
+
+# Image file extensions that Telegram renders inline as photos.
+# Shared between bot.py (inbound document handling) and webhook.py (send-file API).
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+# ── Config dataclass ─────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,15 @@ class Config:
     # When unset, Claude runs as the same user as the bot (development default).
     claude_user: str | None = None
 
+    # TOTP two-factor authentication timing (only relevant when TOTP is enabled)
+    totp_session_minutes: int = 30
+    totp_challenge_seconds: int = 120
+    totp_lockout_attempts: int = 3
+    totp_lockout_minutes: int = 15
+
+
+# ── Config loading ───────────────────────────────────────────────────
+
 
 def _read_protected_file(path: str) -> str | None:
     """
@@ -161,6 +186,8 @@ def load_config() -> Config:
         for line in protected_env.splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
+                # Handle `export KEY=VALUE` lines (common in shell-sourced env files)
+                line = line.removeprefix("export ")
                 key, _, value = line.partition("=")
                 os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
     else:
@@ -194,9 +221,9 @@ def load_config() -> Config:
                 "when TELEGRAM_WEBHOOK_URL is set. Without it, anyone could POST fake updates "
                 "to the Telegram webhook endpoint."
             )
-        logging.info("Telegram transport: webhook (%s)", telegram_webhook_url)
+        log.info("Telegram transport: webhook (%s)", telegram_webhook_url)
     else:
-        logging.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
+        log.info("Telegram transport: polling (TELEGRAM_WEBHOOK_URL not set)")
 
     # Validate required: allowed user IDs (comma-separated numeric Telegram user IDs)
     raw_ids = os.environ.get("ALLOWED_USER_IDS", "")
@@ -234,7 +261,38 @@ def load_config() -> Config:
             if p.is_dir():
                 allowed_workspaces.append(p)
             else:
-                logging.warning("ALLOWED_WORKSPACES: skipping non-existent path: %s", p)
+                log.warning("ALLOWED_WORKSPACES: skipping non-existent path: %s", p)
+
+    # Validate numeric config - fail fast with clear messages rather than
+    # cryptic ValueError tracebacks from int()/float() on bad input
+    try:
+        claude_timeout_seconds = int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120"))
+    except ValueError:
+        raise SystemExit("CLAUDE_TIMEOUT_SECONDS must be an integer") from None
+    try:
+        claude_max_budget_usd = float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0"))
+    except ValueError:
+        raise SystemExit("CLAUDE_MAX_BUDGET_USD must be a number") from None
+    try:
+        webhook_port = int(os.environ.get("WEBHOOK_PORT", "8080"))
+    except ValueError:
+        raise SystemExit("WEBHOOK_PORT must be an integer") from None
+    try:
+        totp_session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
+    except ValueError:
+        raise SystemExit("TOTP_SESSION_MINUTES must be an integer") from None
+    try:
+        totp_challenge_seconds = int(os.environ.get("TOTP_CHALLENGE_SECONDS", "120"))
+    except ValueError:
+        raise SystemExit("TOTP_CHALLENGE_SECONDS must be an integer") from None
+    try:
+        totp_lockout_attempts = int(os.environ.get("TOTP_LOCKOUT_ATTEMPTS", "3"))
+    except ValueError:
+        raise SystemExit("TOTP_LOCKOUT_ATTEMPTS must be an integer") from None
+    try:
+        totp_lockout_minutes = int(os.environ.get("TOTP_LOCKOUT_MINUTES", "15"))
+    except ValueError:
+        raise SystemExit("TOTP_LOCKOUT_MINUTES must be an integer") from None
 
     return Config(
         telegram_bot_token=token,
@@ -242,13 +300,17 @@ def load_config() -> Config:
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
         claude_model=os.environ.get("CLAUDE_MODEL", "sonnet"),
-        claude_timeout_seconds=int(os.environ.get("CLAUDE_TIMEOUT_SECONDS", "120")),
-        claude_max_budget_usd=float(os.environ.get("CLAUDE_MAX_BUDGET_USD", "10.0")),
-        webhook_port=int(os.environ.get("WEBHOOK_PORT", "8080")),
+        claude_timeout_seconds=claude_timeout_seconds,
+        claude_max_budget_usd=claude_max_budget_usd,
+        webhook_port=webhook_port,
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         voice_enabled=os.environ.get("VOICE_ENABLED", "").lower() in ("1", "true", "yes"),
         tts_enabled=os.environ.get("TTS_ENABLED", "").lower() in ("1", "true", "yes"),
         workspace_base=workspace_base,
         allowed_workspaces=allowed_workspaces,
         claude_user=os.environ.get("CLAUDE_USER") or None,
+        totp_session_minutes=totp_session_minutes,
+        totp_challenge_seconds=totp_challenge_seconds,
+        totp_lockout_attempts=totp_lockout_attempts,
+        totp_lockout_minutes=totp_lockout_minutes,
     )

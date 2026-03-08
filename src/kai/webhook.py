@@ -36,6 +36,7 @@ event type to formatter function) makes it easy to add new event types.
 """
 
 import asyncio
+import functools
 import hashlib
 import hmac
 import json
@@ -47,6 +48,7 @@ from aiohttp import web
 from telegram import Update
 
 from kai import cron, sessions
+from kai.config import IMAGE_EXTENSIONS
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +85,22 @@ def _strip_markdown(text: str) -> str:
     text = text.replace("`", "")  # inline code
     text = re.sub(r"(?<!\w)_(\S.*?\S)_(?!\w)", r"\1", text)  # _italic_ but not snake_case
     return text
+
+
+def _require_secret(handler):
+    """Decorator that validates the X-Webhook-Secret header before
+    calling the route handler. Returns 401 on mismatch."""
+
+    @functools.wraps(handler)
+    async def wrapper(request: web.Request) -> web.Response:
+        secret = request.app["webhook_secret"]
+        provided = request.headers.get("X-Webhook-Secret", "")
+        if not hmac.compare_digest(provided, secret):
+            log.warning("Auth failure on %s from %s", request.path, request.remote)
+            return web.Response(status=401, text="Invalid secret")
+        return await handler(request)
+
+    return wrapper
 
 
 # ── GitHub event formatters ───────────────────────────────────────────
@@ -322,34 +340,30 @@ async def _handle_github(request: web.Request) -> web.Response:
             return web.json_response({"msg": "error"})
     log.info("Sent GitHub %s notification to chat %d", event_type, chat_id)
 
-    return web.json_response({"msg": "ok"})
+    return web.json_response({"status": "ok"})
 
 
+@_require_secret
 async def _handle_generic(request: web.Request) -> web.Response:
     """
     Handle generic webhook notifications from any source.
 
-    Validates the shared secret via X-Webhook-Secret header, extracts a
-    "message" field from the JSON payload (or dumps the full payload), and
-    forwards it to the Telegram chat. Truncates to Telegram's 4096-char limit.
+    Extracts a "message" field from the JSON payload (or dumps the full
+    payload) and forwards it to the Telegram chat. Truncates to Telegram's
+    4096-char limit.
     """
-    secret = request.app["webhook_secret"]
     bot = request.app["telegram_bot"]
     chat_id = request.app["chat_id"]
-
-    # Validate shared secret header (constant-time comparison)
-    provided = request.headers.get("X-Webhook-Secret", "")
-    if not hmac.compare_digest(provided, secret):
-        log.warning("Generic webhook: invalid secret")
-        return web.Response(status=401, text="Invalid secret")
 
     try:
         payload = await request.json()
     except json.JSONDecodeError:
         return web.Response(status=400, text="Invalid JSON")
 
-    # Use the "message" field if present, otherwise dump the full JSON
-    text = payload.get("message") or json.dumps(payload, indent=2)
+    # Use the "message" field if present (including empty string),
+    # otherwise dump the full JSON. `is not None` avoids treating "" as absent.
+    msg = payload.get("message")
+    text = msg if msg is not None else json.dumps(payload, indent=2)
     if len(text) > 4096:
         text = text[:4093] + "..."
 
@@ -358,7 +372,7 @@ async def _handle_generic(request: web.Request) -> web.Response:
     except Exception:
         log.exception("Failed to send generic webhook notification")
 
-    return web.json_response({"msg": "ok"})
+    return web.json_response({"status": "ok"})
 
 
 # ── Scheduling API ───────────────────────────────────────────────────
@@ -370,6 +384,7 @@ _VALID_SCHEDULE_TYPES = ("once", "daily", "interval")
 _VALID_JOB_TYPES = ("reminder", "claude")
 
 
+@_require_secret
 async def _handle_schedule(request: web.Request) -> web.Response:
     """
     Create a new scheduled job via the HTTP API.
@@ -387,17 +402,10 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     Returns:
         JSON with job_id and name on success, or an error message on failure.
     """
-    secret = request.app["webhook_secret"]
-
-    # Validate shared secret
-    provided = request.headers.get("X-Webhook-Secret", "")
-    if not hmac.compare_digest(provided, secret):
-        return web.Response(status=401, text="Invalid secret")
-
     try:
         payload = await request.json()
     except json.JSONDecodeError:
-        return web.Response(status=400, text="Invalid JSON")
+        return web.json_response({"error": "Invalid JSON"}, status=400)
 
     # Extract and validate required fields
     name = payload.get("name")
@@ -405,7 +413,9 @@ async def _handle_schedule(request: web.Request) -> web.Response:
     schedule_type = payload.get("schedule_type")
     schedule_data = payload.get("schedule_data")
 
-    if not all([name, prompt, schedule_type, schedule_data]):
+    # Use `is None` checks so empty strings (e.g., prompt="") are not
+    # rejected as missing. Truthiness would treat "" as absent.
+    if name is None or prompt is None or schedule_type is None or schedule_data is None:
         return web.json_response(
             {"error": "Missing required fields: name, prompt, schedule_type, schedule_data"},
             status=400,
@@ -461,6 +471,7 @@ async def _handle_schedule(request: web.Request) -> web.Response:
 # ── Jobs API ─────────────────────────────────────────────────────────
 
 
+@_require_secret
 async def _handle_get_jobs(request: web.Request) -> web.Response:
     """
     List all active jobs for the configured chat.
@@ -468,28 +479,19 @@ async def _handle_get_jobs(request: web.Request) -> web.Response:
     Used by the inner Claude to check what jobs are currently scheduled
     without needing to parse Telegram bot command output.
     """
-    secret = request.app["webhook_secret"]
-
-    provided = request.headers.get("X-Webhook-Secret", "")
-    if not hmac.compare_digest(provided, secret):
-        return web.Response(status=401, text="Invalid secret")
 
     chat_id = request.app["chat_id"]
     jobs = await sessions.get_jobs(chat_id)
     return web.json_response(jobs)
 
 
+@_require_secret
 async def _handle_get_job(request: web.Request) -> web.Response:
     """
     Get a single job by its database ID.
 
     Returns the full job record as JSON, or 404 if not found.
     """
-    secret = request.app["webhook_secret"]
-
-    provided = request.headers.get("X-Webhook-Secret", "")
-    if not hmac.compare_digest(provided, secret):
-        return web.Response(status=401, text="Invalid secret")
 
     try:
         job_id = int(request.match_info["id"])
@@ -502,6 +504,7 @@ async def _handle_get_job(request: web.Request) -> web.Response:
     return web.json_response(job)
 
 
+@_require_secret
 async def _handle_delete_job(request: web.Request) -> web.Response:
     """
     Delete a scheduled job by ID via the HTTP API.
@@ -510,11 +513,6 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     queue. Uses the same logic as the /canceljob Telegram command.
     Returns 404 if the job doesn't exist.
     """
-    secret = request.app["webhook_secret"]
-
-    provided = request.headers.get("X-Webhook-Secret", "")
-    if not hmac.compare_digest(provided, secret):
-        return web.Response(status=401, text="Invalid secret")
 
     try:
         job_id = int(request.match_info["id"])
@@ -540,6 +538,7 @@ async def _handle_delete_job(request: web.Request) -> web.Response:
     return web.json_response({"deleted": job_id})
 
 
+@_require_secret
 async def _handle_update_job(request: web.Request) -> web.Response:
     """
     Update a scheduled job's mutable fields via the HTTP API.
@@ -551,11 +550,6 @@ async def _handle_update_job(request: web.Request) -> web.Response:
 
     Returns 404 if the job doesn't exist or is inactive.
     """
-    secret = request.app["webhook_secret"]
-
-    provided = request.headers.get("X-Webhook-Secret", "")
-    if not hmac.compare_digest(provided, secret):
-        return web.Response(status=401, text="Invalid secret")
 
     try:
         job_id = int(request.match_info["id"])
@@ -615,6 +609,7 @@ async def _handle_update_job(request: web.Request) -> web.Response:
 # ── Service proxy ────────────────────────────────────────────────────
 
 
+@_require_secret
 async def _handle_service_call(request: web.Request) -> web.Response:
     """
     Proxy an authenticated request to an external service.
@@ -634,13 +629,6 @@ async def _handle_service_call(request: web.Request) -> web.Response:
         JSON {"status": N, "body": "..."} on success, or
         JSON {"error": "..."} with HTTP 502 on failure.
     """
-    secret = request.app["webhook_secret"]
-
-    # Validate shared secret (same auth as scheduling API)
-    provided = request.headers.get("X-Webhook-Secret", "")
-    if not hmac.compare_digest(provided, secret):
-        log.warning("Service proxy: invalid secret")
-        return web.Response(status=401, text="Invalid secret")
 
     # Extract service name from URL path
     service_name = request.match_info["name"]
@@ -675,11 +663,8 @@ async def _handle_service_call(request: web.Request) -> web.Response:
 
 # ── File exchange ────────────────────────────────────────────────────
 
-# Image extensions sent as Telegram photos (rendered inline); everything
-# else is sent as a document attachment.
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
-
+@_require_secret
 async def _handle_send_file(request: web.Request) -> web.Response:
     """
     Send a file from the filesystem to the Telegram chat.
@@ -696,16 +681,10 @@ async def _handle_send_file(request: web.Request) -> web.Response:
         JSON {"status": "sent", "file": "<filename>"} on success, or an
         appropriate HTTP error (400/401/403/404).
     """
-    secret = request.app["webhook_secret"]
-
-    # Validate shared secret (same auth as all other API endpoints)
-    if not hmac.compare_digest(request.headers.get("X-Webhook-Secret", ""), secret):
-        return web.Response(status=401, text="Invalid secret")
-
     try:
         payload = await request.json()
     except json.JSONDecodeError:
-        return web.Response(status=400, text="Invalid JSON")
+        return web.json_response({"error": "Invalid JSON"}, status=400)
 
     file_path = payload.get("path")
     if not file_path:
@@ -716,13 +695,16 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     # Confine to the current workspace to prevent path traversal. Uses
     # Path.relative_to() which raises ValueError on escape, unlike string
     # prefix matching which is bypassable via symlinks.
+    # Fail closed: if workspace is somehow unset, deny all file access
+    # rather than allowing reads from anywhere on the filesystem.
     workspace = request.app.get("workspace")
-    if workspace:
-        workspace_resolved = Path(workspace).resolve()
-        try:
-            path.relative_to(workspace_resolved)
-        except ValueError:
-            return web.json_response({"error": "Path outside workspace"}, status=403)
+    if not workspace:
+        return web.json_response({"error": "No workspace configured"}, status=403)
+    workspace_resolved = Path(workspace).resolve()
+    try:
+        path.relative_to(workspace_resolved)
+    except ValueError:
+        return web.json_response({"error": "Path outside workspace"}, status=403)
 
     if not path.is_file():
         return web.json_response({"error": f"File not found: {file_path}"}, status=404)
@@ -735,7 +717,7 @@ async def _handle_send_file(request: web.Request) -> web.Response:
     # else as document attachments (preserves filename, allows any type).
     try:
         suffix = path.suffix.lower()
-        if suffix in _IMAGE_EXTENSIONS:
+        if suffix in IMAGE_EXTENSIONS:
             with open(path, "rb") as f:
                 await bot.send_photo(chat_id, f, caption=caption or None)
         else:
@@ -775,8 +757,13 @@ async def start(telegram_app, config) -> None:
     _app["telegram_bot"] = telegram_app.bot
     _app["webhook_secret"] = config.webhook_secret
 
-    # Use first allowed user ID as the notification target
-    _app["chat_id"] = next(iter(config.allowed_user_ids))
+    # Use first allowed user ID as the notification target.
+    # Config validation ensures allowed_user_ids is non-empty, but guard
+    # against edge cases to avoid a StopIteration crash at startup.
+    chat_id = next(iter(config.allowed_user_ids), None)
+    if chat_id is None:
+        raise SystemExit("No allowed user IDs configured; cannot start webhook server")
+    _app["chat_id"] = chat_id
 
     # Store workspace path for send-file path confinement
     _app["workspace"] = str(config.claude_workspace)

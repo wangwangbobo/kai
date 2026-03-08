@@ -30,13 +30,15 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 
-from kai.config import PROJECT_ROOT
+from kai.config import PROJECT_ROOT, VALID_MODELS
 
-# Config file written by `config`, read by `apply`
-INSTALL_CONF = Path("install.conf")
+# Config file written by `config`, read by `apply`.
+# Anchored to PROJECT_ROOT so it resolves correctly regardless of CWD.
+INSTALL_CONF = PROJECT_ROOT / "install.conf"
 
 # Default installation paths
 _DEFAULT_INSTALL_DIR = "/opt/kai"
@@ -45,9 +47,6 @@ _DEFAULT_SERVICE_USER = "kai"
 
 # Current install.conf schema version
 _CONF_VERSION = 1
-
-# Valid Claude model names
-_VALID_MODELS = {"haiku", "sonnet", "opus"}
 
 # Plist label for the launchd service
 _LAUNCHD_LABEL = "com.syrinx.kai"
@@ -206,16 +205,14 @@ def _cmd_config() -> None:
         existing.get("install_dir", _DEFAULT_INSTALL_DIR),
     )
     if not os.path.isabs(install_dir):
-        print("Error: install location must be an absolute path.")
-        sys.exit(1)
+        raise SystemExit("Install location must be an absolute path.")
 
     data_dir = _prompt(
         "Data directory",
         existing.get("data_dir", _DEFAULT_DATA_DIR),
     )
     if not os.path.isabs(data_dir):
-        print("Error: data directory must be an absolute path.")
-        sys.exit(1)
+        raise SystemExit("Data directory must be an absolute path.")
 
     service_user = _prompt(
         "Service user",
@@ -272,7 +269,7 @@ def _cmd_config() -> None:
     print("-- Claude --")
     model = _prompt_choice(
         "Claude model",
-        ["haiku", "sonnet", "opus"],
+        sorted(VALID_MODELS),
         existing_env.get("CLAUDE_MODEL", "sonnet"),
     )
 
@@ -395,11 +392,19 @@ def _cmd_config() -> None:
     }
 
     INSTALL_CONF.write_text(json.dumps(conf, indent=2) + "\n")
+    # Restrict permissions since the file contains secrets (bot token, webhook secret)
+    os.chmod(INSTALL_CONF, 0o600)
     print(f"Configuration written to {INSTALL_CONF}")
     print("Review the file, then run: sudo python -m kai install apply")
 
 
 # ── Apply subcommand ─────────────────────────────────────────────────
+
+
+def _parse_workspaces(env: dict[str, str]) -> list[Path]:
+    """Parse ALLOWED_WORKSPACES from an env dict into a list of Paths."""
+    raw = env.get("ALLOWED_WORKSPACES", "")
+    return [Path(ws.strip()) for ws in raw.split(",") if ws.strip()]
 
 
 def _file_checksum(path: Path) -> str:
@@ -464,7 +469,10 @@ def _generate_env_file(env: dict[str, str]) -> str:
     lines.append("# Do not edit manually; re-run install config + apply instead.")
     lines.append("")
     for key, value in sorted(env.items()):
-        lines.append(f"{key}={value}")
+        # Quote values to handle spaces and special characters. Escape
+        # embedded backslashes and double quotes so the file parses correctly.
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'{key}="{escaped}"')
     lines.append("")
     return "\n".join(lines)
 
@@ -536,7 +544,7 @@ def _user_home(username: str) -> str:
         return f"/home/{username}"
 
 
-def _generate_launcher_script(install_dir: str) -> str:
+def _generate_launcher_script(install_dir: str, webhook_port: int = 8080) -> str:
     """
     Generate a launcher script for launchd.
 
@@ -561,11 +569,11 @@ def _generate_launcher_script(install_dir: str) -> str:
 
         # Find the actual Python process (the re-exec'd grandchild).
         # lsof lives at /usr/sbin/ which may not be in the service PATH.
-        REAL_PID=$(/usr/sbin/lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+        REAL_PID=$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)
         if [ -z "$REAL_PID" ]; then
             # Hasn't bound yet; wait a bit more
             sleep 3
-            REAL_PID=$(/usr/sbin/lsof -ti :8080 -sTCP:LISTEN 2>/dev/null)
+            REAL_PID=$(/usr/sbin/lsof -ti :{webhook_port} -sTCP:LISTEN 2>/dev/null)
         fi
 
         cleanup() {{
@@ -702,7 +710,7 @@ def _generate_systemd_unit(install_dir: str, data_dir: str, service_user: str) -
     """)
 
 
-def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool) -> None:
+def _stop_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     """
     Stop the Kai service before applying changes.
 
@@ -711,8 +719,6 @@ def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool)
 
     Args:
         platform: "darwin" or "linux".
-        svc_uid: Numeric UID of the service user (unused, kept for API compat).
-        service_user: OS username that runs the service (unused on macOS).
         dry_run: If True, print the command without executing.
     """
     if platform == "darwin":
@@ -727,21 +733,34 @@ def _stop_service(platform: str, svc_uid: int, service_user: str, dry_run: bool)
     if dry_run:
         print(f"[DRY RUN] Would run: {' '.join(cmd)}")
     else:
-        subprocess.run(cmd, check=False, capture_output=True)
-        print(f"  Stopped service ({' '.join(cmd[:2])})")
+        result = subprocess.run(cmd, check=False, capture_output=True)
+        if result.returncode == 0:
+            print(f"  Stopped service ({' '.join(cmd[:2])})")
+            # Give launchd time to fully release the service domain.
+            # Without this, a subsequent bootstrap can fail transiently
+            # on KeepAlive daemons.
+            if platform == "darwin":
+                import time
+
+                time.sleep(2)
+        else:
+            # Non-zero is expected on first install (service not yet registered)
+            print(f"  Service not running ({' '.join(cmd[:2])})")
 
 
-def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool) -> None:
+def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     """
     Start the Kai service after applying changes.
 
     Best-effort: uses check=False since launchctl/systemctl may report
     warnings that aren't actually failures (e.g., service already running).
 
+    On macOS, launchctl bootstrap can fail transiently after a bootout
+    if launchd hasn't fully released the service domain (common with
+    KeepAlive daemons). We retry once after a brief delay to handle this.
+
     Args:
         platform: "darwin" or "linux".
-        svc_uid: Numeric UID of the service user (unused, kept for API compat).
-        service_user: OS username that runs the service (unused on macOS).
         dry_run: If True, print the command without executing.
     """
     if platform == "darwin":
@@ -755,9 +774,30 @@ def _start_service(platform: str, svc_uid: int, service_user: str, dry_run: bool
 
     if dry_run:
         print(f"[DRY RUN] Would run: {' '.join(cmd)}")
-    else:
-        subprocess.run(cmd, check=False, capture_output=True)
+        return
+
+    result = subprocess.run(cmd, check=False, capture_output=True)
+    if result.returncode == 0:
         print(f"  Started service ({' '.join(cmd[:2])})")
+        return
+
+    # On macOS, bootstrap can fail transiently after bootout.
+    # Wait briefly for launchd to finish tearing down, then retry.
+    if platform == "darwin":
+        import time
+
+        stderr_msg = result.stderr.decode().strip()
+        print(f"  Bootstrap failed ({stderr_msg or 'unknown'}), retrying...")
+        time.sleep(2)
+        result = subprocess.run(cmd, check=False, capture_output=True)
+        if result.returncode == 0:
+            print(f"  Started service ({' '.join(cmd[:2])})")
+            return
+
+    # Show the actual error so the user knows what went wrong
+    stderr_text = result.stderr.decode().strip()
+    hint = f": {stderr_text}" if stderr_text else ""
+    print(f"  Warning: service start failed ({' '.join(cmd[:2])}){hint}")
 
 
 def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
@@ -842,18 +882,15 @@ def _cmd_apply() -> None:
     """
     # -- Validate preconditions --
     if os.geteuid() != 0:
-        print("Error: 'install apply' must be run as root (try: sudo python -m kai install apply)")
-        sys.exit(1)
+        raise SystemExit("'install apply' must be run as root (try: sudo python -m kai install apply)")
 
     if not INSTALL_CONF.exists():
-        print(f"Error: {INSTALL_CONF} not found. Run 'python -m kai install config' first.")
-        sys.exit(1)
+        raise SystemExit(f"{INSTALL_CONF} not found. Run 'python -m kai install config' first.")
 
     try:
         conf = json.loads(INSTALL_CONF.read_text())
     except (json.JSONDecodeError, OSError) as e:
-        print(f"Error: could not read {INSTALL_CONF}: {e}")
-        sys.exit(1)
+        raise SystemExit(f"Could not read {INSTALL_CONF}: {e}") from e
 
     # Validate required fields
     install_dir = conf.get("install_dir")
@@ -863,8 +900,7 @@ def _cmd_apply() -> None:
     env = conf.get("env", {})
 
     if not all([install_dir, data_dir, service_user, platform]):
-        print("Error: install.conf is missing required fields.")
-        sys.exit(1)
+        raise SystemExit("install.conf is missing required fields.")
 
     # Validate service user exists
     try:
@@ -872,8 +908,7 @@ def _cmd_apply() -> None:
         svc_uid = user_info.pw_uid
         svc_gid = user_info.pw_gid
     except KeyError:
-        print(f"Error: service user '{service_user}' does not exist on this system.")
-        sys.exit(1)
+        raise SystemExit(f"Service user '{service_user}' does not exist on this system.") from None
 
     dry_run = os.environ.get("DRY_RUN", "").strip() in ("1", "true", "yes")
     if dry_run:
@@ -890,7 +925,7 @@ def _cmd_apply() -> None:
     print()
 
     # -- Stop service before making changes --
-    _stop_service(platform, svc_uid, service_user, dry_run)
+    _stop_service(platform, dry_run)
 
     # -- Step 1: Create directories --
     # Resolve WORKSPACE_BASE, expanding ~ relative to the service user's home
@@ -913,10 +948,7 @@ def _cmd_apply() -> None:
     ws_paths: list[Path] = []
     if ws_base:
         ws_paths.append(ws_base)
-    for ws_raw in env.get("ALLOWED_WORKSPACES", "").split(","):
-        ws_raw = ws_raw.strip()
-        if ws_raw:
-            ws_paths.append(Path(ws_raw))
+    ws_paths.extend(_parse_workspaces(env))
     for ws_path in ws_paths:
         warning = _check_traversal(ws_path, service_user)
         if warning:
@@ -942,10 +974,11 @@ def _cmd_apply() -> None:
     _apply_migrate(data_path, svc_uid, svc_gid, dry_run)
 
     # -- Step 8: Generate service definition --
-    _apply_service(install_dir, data_dir, service_user, platform, dry_run)
+    webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
+    _apply_service(install_dir, data_dir, service_user, platform, dry_run, webhook_port)
 
     # -- Start service after all changes --
-    _start_service(platform, svc_uid, service_user, dry_run)
+    _start_service(platform, dry_run)
 
     # -- Summary --
     print()
@@ -968,7 +1001,22 @@ def _apply_directories(
     dry_run: bool,
     workspace_base: Path | None = None,
 ) -> None:
-    """Create the directory structure for the installation."""
+    """
+    Create the directory structure for the installation.
+
+    Builds a list of (path, uid, gid, mode) tuples for all required
+    directories and creates any that don't already exist. The install
+    tree is root-owned except for the workspace and data directories,
+    which must be writable by the service user.
+
+    Args:
+        install_path: Root of the install tree (e.g., /opt/kai).
+        data_path: Writable data directory (e.g., /var/lib/kai).
+        svc_uid: UID of the service user.
+        svc_gid: GID of the service user.
+        dry_run: If True, print what would be created without doing it.
+        workspace_base: Optional base directory for workspace name resolution.
+    """
     # The workspace dir under the install path must be writable by the service
     # user so history.py can create .claude/history/ inside it. The rest of
     # the install tree stays root-owned and read-only.
@@ -1022,7 +1070,19 @@ def _apply_source(install_path: Path, dry_run: bool) -> None:
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
-    """Create or update the virtual environment in the install location."""
+    """
+    Create or update the virtual environment in the install location.
+
+    On a fresh install, creates a venv with the system Python and pip-installs
+    the package with optional extras (totp, tts). On update, compares the
+    pyproject.toml checksum to detect dependency changes and only reinstalls
+    if needed. Rejects Python versions below 3.12.
+
+    Args:
+        install_path: Root of the install tree containing src/ and pyproject.toml.
+        is_update: True if updating an existing installation (vs fresh install).
+        dry_run: If True, print what would be done without doing it.
+    """
     venv_path = install_path / "venv"
     pyproject_dst = install_path / "pyproject.toml"
 
@@ -1063,7 +1123,9 @@ def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:
             check=False,
         )
         if result.returncode == 0:
-            major, minor = result.stdout.strip().split(".")
+            # Split with maxsplit=2 to handle patch versions like "3.13.1"
+            parts = result.stdout.strip().split(".", maxsplit=2)
+            major, minor = parts[0], parts[1]
             if (int(major), int(minor)) < (3, 13):
                 raise SystemExit(
                     f"Python >= 3.13 required, but {python} is {result.stdout.strip()}. "
@@ -1147,30 +1209,54 @@ def _apply_sudoers(service_user: str, dry_run: bool, claude_user: str | None = N
         print("[DRY RUN] Would validate with visudo -cf")
         return
 
-    # Write to a temp file first, validate, then move into place.
-    # This prevents writing an invalid sudoers file that locks out sudo.
-    tmp_path = Path("/tmp/kai-sudoers-check")
-    tmp_path.write_text(sudoers_content)
+    # Write to a secure temp file first, validate, then move into place.
+    # Uses mkstemp (random name, restrictive permissions) instead of a
+    # predictable path in /tmp to prevent symlink attacks when running as root.
+    fd, tmp_name = tempfile.mkstemp(prefix="kai-sudoers-", suffix=".tmp")
+    try:
+        os.write(fd, sudoers_content.encode())
+        os.close(fd)
 
-    result = subprocess.run(
-        ["visudo", "-cf", str(tmp_path)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        tmp_path.unlink(missing_ok=True)
-        print(f"Error: sudoers validation failed: {result.stderr.strip()}")
-        print("  Sudoers file was NOT written. Fix the issue and re-run.")
-        sys.exit(1)
+        result = subprocess.run(
+            ["visudo", "-cf", tmp_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise SystemExit(
+                f"Sudoers validation failed: {result.stderr.strip()}\n"
+                "  Sudoers file was NOT written. Fix the issue and re-run."
+            )
 
-    shutil.move(str(tmp_path), str(sudoers_path))
+        shutil.move(tmp_name, str(sudoers_path))
+    finally:
+        # Clean up the temp file if it still exists (move succeeded or error)
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
     os.chmod(sudoers_path, 0o440)
     os.chown(sudoers_path, 0, 0)
     print(f"  Wrote {sudoers_path}")
 
 
-def _apply_service(install_dir: str, data_dir: str, service_user: str, platform: str, dry_run: bool) -> None:
-    """Generate the platform-specific service definition."""
+def _apply_service(
+    install_dir: str, data_dir: str, service_user: str, platform: str, dry_run: bool, webhook_port: int = 8080
+) -> None:
+    """
+    Generate and install the platform-specific service definition.
+
+    On macOS, writes a LaunchDaemon plist and a launcher shell script
+    (the script keeps bash as the tracked PID so launchd can manage the
+    service even when Homebrew Python re-execs). On Linux, writes a
+    systemd unit file.
+
+    Args:
+        install_dir: Root of the install tree (e.g., /opt/kai).
+        data_dir: Writable data directory (e.g., /var/lib/kai).
+        service_user: OS username the service runs as.
+        platform: "darwin" or "linux".
+        dry_run: If True, print what would be written without doing it.
+        webhook_port: Port for the webhook/API server (passed to launcher).
+    """
     if platform == "darwin":
         # LaunchDaemons (not LaunchAgents) so the service runs under the
         # system domain at boot, independent of any user login session.
@@ -1181,7 +1267,7 @@ def _apply_service(install_dir: str, data_dir: str, service_user: str, platform:
         # Launcher script keeps bash as the tracked PID so launchd can
         # manage the service even when Homebrew Python re-execs.
         launcher_path = Path(install_dir) / "run.sh"
-        launcher_content = _generate_launcher_script(install_dir)
+        launcher_content = _generate_launcher_script(install_dir, webhook_port)
 
         if dry_run:
             print(f"[DRY RUN] Would write: {launcher_path}")
@@ -1365,10 +1451,7 @@ def _cmd_status() -> None:
                 ws_base = env.get("WORKSPACE_BASE", "")
                 if ws_base:
                     ws_paths.append(Path(ws_base))
-                for ws_raw in env.get("ALLOWED_WORKSPACES", "").split(","):
-                    ws_raw = ws_raw.strip()
-                    if ws_raw:
-                        ws_paths.append(Path(ws_raw))
+                ws_paths.extend(_parse_workspaces(env))
                 for ws_path in ws_paths:
                     warning = _check_traversal(ws_path, svc_user)
                     if warning:
@@ -1405,8 +1488,7 @@ def cli(args: list[str]) -> None:
     }
 
     if not args or args[0] not in subcommands:
-        print("Usage: python -m kai install {config|apply|status}")
-        sys.exit(1)
+        raise SystemExit("Usage: python -m kai install {config|apply|status}")
 
     subcmd = args[0]
     remaining = args[1:]

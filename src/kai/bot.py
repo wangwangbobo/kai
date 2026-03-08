@@ -34,7 +34,7 @@ import base64
 import functools
 import json
 import logging
-import os
+import math
 import shutil
 import time
 from datetime import datetime
@@ -54,7 +54,7 @@ from telegram.ext import (
 
 from kai import services, sessions, webhook
 from kai.claude import PersistentClaude
-from kai.config import DATA_DIR, Config
+from kai.config import DATA_DIR, IMAGE_EXTENSIONS, Config
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
@@ -193,9 +193,11 @@ async def _edit_message_safe(msg: Message, text: str) -> None:
         try:
             await msg.edit_text(truncated)
         except Exception:
-            pass
+            # Editing is best-effort during streaming; log at debug so persistent
+            # issues (e.g., revoked bot token) leave a diagnostic trail
+            log.debug("Failed to edit message (plain-text fallback)", exc_info=True)
     except Exception:
-        pass
+        log.debug("Failed to edit message", exc_info=True)
 
 
 def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
@@ -269,6 +271,8 @@ async def handle_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── Model selection ──────────────────────────────────────────────────
 
 # Available Claude models with display names (emoji prefix for visual distinction)
+# Keys must match VALID_MODELS in config.py (the single source of truth
+# for valid model identifiers). Values are display names for Telegram.
 _AVAILABLE_MODELS = {
     "opus": "\U0001f9e0 Claude Opus 4.6",
     "sonnet": "\u26a1 Claude Sonnet 4.5",
@@ -619,9 +623,11 @@ def _resolve_workspace_path(target: str, base: Path | None) -> Path | None:
     """
     if not base:
         return None
-    resolved = (base / target).resolve()
-    # Prevent traversal outside the base directory
-    if not str(resolved).startswith(str(base) + "/") and resolved != base:
+    # expanduser() handles ~ in the target path (e.g., "~/Projects/foo")
+    resolved = (base / target).expanduser().resolve()
+    # Resolve base too so symlinks in the base path don't bypass the check
+    resolved_base = base.resolve()
+    if not str(resolved).startswith(str(resolved_base) + "/") and resolved != resolved_base:
         return None
     return resolved
 
@@ -646,7 +652,9 @@ def _is_workspace_allowed(path: Path, config: "Config") -> bool:
         # No restrictions configured — open access
         return True
     resolved = path.resolve()
-    in_base = base and (str(resolved).startswith(str(base) + "/") or resolved == base)
+    # Resolve base too so symlinks in the base path don't bypass the check
+    resolved_base = base.resolve() if base else None
+    in_base = resolved_base and (str(resolved).startswith(str(resolved_base) + "/") or resolved == resolved_base)
     in_allowed = resolved in config.allowed_workspaces
     return bool(in_base or in_allowed)
 
@@ -1204,9 +1212,6 @@ _TEXT_EXTENSIONS = {
     ".erl",
 }
 
-# Image extensions that can be sent as documents (uncompressed)
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-
 # Map image file extensions to MIME types for Claude's image content blocks
 _IMAGE_MEDIA_TYPES = {
     ".png": "image/png",
@@ -1240,7 +1245,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     claude = _get_claude(context)
     model = claude.model
 
-    if suffix in _IMAGE_EXTENSIONS:
+    if suffix in IMAGE_EXTENSIONS:
         # Handle images sent as documents (uncompressed upload)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
@@ -1410,9 +1415,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         assert context.user_data is not None
         assert update.effective_chat is not None
 
+        # Read TOTP timing from the centralized Config object rather than
+        # raw os.environ, so defaults and validation happen in one place.
+        totp_cfg = context.bot_data["config"]
+        session_min = totp_cfg.totp_session_minutes if isinstance(totp_cfg, Config) else 30
+        challenge_sec = totp_cfg.totp_challenge_seconds if isinstance(totp_cfg, Config) else 120
+
         auth_time = context.user_data.get("totp_authenticated_at", 0)
-        session_minutes = int(os.environ.get("TOTP_SESSION_MINUTES", "30"))
-        totp_expired = time.time() - auth_time > session_minutes * 60
+        totp_expired = time.time() - auth_time > session_min * 60
 
         if totp_expired:
             pending = context.user_data.get("totp_pending")
@@ -1420,9 +1430,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not pending:
                 # First message after auth expired - send the challenge and
                 # store a pending state so the next message is treated as a code.
-                challenge_seconds = int(os.environ.get("TOTP_CHALLENGE_SECONDS", "120"))
                 context.user_data["totp_pending"] = {
-                    "expires_at": time.time() + challenge_seconds,
+                    "expires_at": time.time() + challenge_sec,
                 }
                 await update.message.reply_text("Session expired. Enter code from authenticator.")
                 return
@@ -1444,14 +1453,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Check global lockout before calling verify_code().
             lockout_remaining = get_lockout_remaining()
             if lockout_remaining > 0:
-                minutes = lockout_remaining // 60
+                # ceil() so the user never sees "0 more minutes" when <60s remain
+                minutes = math.ceil(lockout_remaining / 60)
                 await update.effective_chat.send_message(
-                    f"Too many failed attempts. Locked out for {minutes} more minutes."
+                    f"Too many failed attempts. Locked out for {minutes} more minute{'s' if minutes != 1 else ''}."
                 )
                 return
 
-            lockout_attempts = int(os.environ.get("TOTP_LOCKOUT_ATTEMPTS", "3"))
-            lockout_minutes = int(os.environ.get("TOTP_LOCKOUT_MINUTES", "15"))
+            lockout_attempts = totp_cfg.totp_lockout_attempts if isinstance(totp_cfg, Config) else 3
+            lockout_minutes = totp_cfg.totp_lockout_minutes if isinstance(totp_cfg, Config) else 15
 
             if verify_code(code, lockout_attempts, lockout_minutes):
                 del context.user_data["totp_pending"]
@@ -1543,10 +1553,12 @@ async def _handle_response(
     # Telegram hides the typing indicator after ~5 seconds, so we
     # re-send it every 4 seconds in a background task.
     chat_action = ChatAction.RECORD_VOICE if voice_only else ChatAction.TYPING
-    typing_active = True
 
     async def _keep_typing():
-        while typing_active:
+        # Loop runs until the task is cancelled via typing_task.cancel().
+        # No shared mutable flag needed - task cancellation is the proper
+        # async mechanism and avoids fragile closure-captured booleans.
+        while True:
             try:
                 await context.bot.send_chat_action(chat_id=chat_id, action=chat_action)
             except Exception:
@@ -1559,6 +1571,7 @@ async def _handle_response(
     last_edit_time = 0.0
     last_edit_text = ""
     final_response = None
+    stopped_by_user = False
 
     try:
         # Reset the stop event (in case /stop was sent between messages)
@@ -1570,6 +1583,7 @@ async def _handle_response(
             # Check for /stop between stream chunks
             if stop_event.is_set():
                 stop_event.clear()
+                stopped_by_user = True
                 if live_msg:
                     await _edit_message_safe(live_msg, last_edit_text + "\n\n_(stopped)_")
                 final_response = None
@@ -1601,16 +1615,17 @@ async def _handle_response(
         # Always cancel the typing indicator, even if the streaming loop
         # exits with an exception. Without this, a leaked _keep_typing task
         # sends typing indicators to the chat indefinitely.
-        typing_active = False
         typing_task.cancel()
         try:
             await typing_task
         except asyncio.CancelledError:
             pass
 
-    # Handle error cases
+    # Handle error cases. Skip the error message if /stop was used -
+    # the user already saw the "(stopped)" edit and doesn't need a false alarm.
     if final_response is None:
-        await update.message.reply_text("Error: No response from Claude")
+        if not stopped_by_user:
+            await update.message.reply_text("Error: No response from Claude")
         return
 
     if not final_response.success:

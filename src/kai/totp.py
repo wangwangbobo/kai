@@ -16,6 +16,7 @@ CLI usage (run as root or with sudo):
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -46,7 +47,7 @@ def _read_secret() -> str | None:
     """
     try:
         result = subprocess.run(
-            ["sudo", "cat", TOTP_SECRET_PATH],
+            ["sudo", "-n", "cat", TOTP_SECRET_PATH],
             capture_output=True,
             text=True,
             timeout=5,
@@ -70,13 +71,17 @@ def _read_attempts() -> dict:
     """
     try:
         result = subprocess.run(
-            ["sudo", "cat", TOTP_ATTEMPTS_PATH],
+            ["sudo", "-n", "cat", TOTP_ATTEMPTS_PATH],
             capture_output=True,
             text=True,
             timeout=5,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout.strip())
+            data = json.loads(result.stdout.strip())
+            # Validate expected types to avoid TypeError on arithmetic later
+            # (e.g., "failures": "abc" would crash on + 1)
+            if isinstance(data, dict) and isinstance(data.get("failures"), (int, float)):
+                return data
     except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
         pass
     return {"failures": 0, "lockout_until": 0}
@@ -92,7 +97,7 @@ def _write_attempts(state: dict) -> None:
     """
     try:
         subprocess.run(
-            ["sudo", "tee", TOTP_ATTEMPTS_PATH],
+            ["sudo", "-n", "tee", TOTP_ATTEMPTS_PATH],
             input=json.dumps(state),
             capture_output=True,
             text=True,
@@ -192,10 +197,10 @@ def verify_code(code: str, lockout_attempts: int = 3, lockout_minutes: int = 15)
 
 # ── CLI entry point (python -m kai totp <subcommand>) ────────────────
 
-# Platform-specific binary paths for the sudoers rule.
-# macOS ships cat at /bin/cat; most Linux distros put it at /usr/bin/cat.
-_CAT = "/bin/cat" if sys.platform == "darwin" else "/usr/bin/cat"
-_TEE = "/usr/bin/tee"
+# Resolve binary paths for the sudoers rule. shutil.which() finds the
+# binary on the current PATH; fallbacks match platform conventions.
+_CAT = shutil.which("cat") or ("/bin/cat" if sys.platform == "darwin" else "/usr/bin/cat")
+_TEE = shutil.which("tee") or "/usr/bin/tee"
 
 
 def _cmd_setup() -> None:
@@ -207,7 +212,7 @@ def _cmd_setup() -> None:
     files owned by root. Exits with a non-zero status on any failure.
     """
     if os.geteuid() != 0:
-        print("Error: 'totp setup' must be run as root (try: sudo python -m kai totp setup)")
+        print("'totp setup' must be run as root (try: sudo python -m kai totp setup)")
         sys.exit(1)
 
     # Create /etc/kai/ if it doesn't exist, owned by root.
@@ -217,16 +222,18 @@ def _cmd_setup() -> None:
     # Generate a cryptographically random base32 secret.
     secret = pyotp.random_base32()
 
-    # Write secret file: root:root 0600.
-    with open(TOTP_SECRET_PATH, "w") as f:
+    # Write secret file: root:root 0600. Uses os.open() with explicit mode
+    # to avoid a TOCTOU window where the file briefly exists with default
+    # umask permissions before chmod() tightens them.
+    fd = os.open(TOTP_SECRET_PATH, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(secret)
-    os.chmod(TOTP_SECRET_PATH, 0o600)
     os.chown(TOTP_SECRET_PATH, 0, 0)
 
     # Create a clean attempts file: root:root 0600.
-    with open(TOTP_ATTEMPTS_PATH, "w") as f:
+    fd = os.open(TOTP_ATTEMPTS_PATH, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(json.dumps({"failures": 0, "lockout_until": 0}))
-    os.chmod(TOTP_ATTEMPTS_PATH, 0o600)
     os.chown(TOTP_ATTEMPTS_PATH, 0, 0)
 
     # Generate and print the QR code to the terminal.
@@ -261,8 +268,10 @@ def _cmd_setup() -> None:
     if verify_code(code):
         print("TOTP setup complete.")
     else:
-        print("Code incorrect. Setup files written but verification failed.")
-        print("Run 'sudo python -m kai totp reset' and try again.")
+        print(
+            "Code incorrect. Setup files written but verification failed.\n"
+            "Run 'sudo python -m kai totp reset' and try again."
+        )
         sys.exit(1)
 
 
@@ -285,7 +294,7 @@ def _cmd_reset() -> None:
     Must be run as root. After reset, the bot will start without TOTP authentication.
     """
     if os.geteuid() != 0:
-        print("Error: 'totp reset' must be run as root (try: sudo python -m kai totp reset)")
+        print("'totp reset' must be run as root (try: sudo python -m kai totp reset)")
         sys.exit(1)
 
     removed = []
