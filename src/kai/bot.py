@@ -54,7 +54,7 @@ from telegram.ext import (
 
 from kai import services, sessions, webhook
 from kai.claude import PersistentClaude
-from kai.config import DATA_DIR, Config
+from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.transcribe import TranscriptionError, transcribe_voice
@@ -770,19 +770,38 @@ def _short_workspace_name(path: str, base: Path | None) -> str:
     return Path(path).name
 
 
-async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> None:
+def _workspace_config_suffix(ws_config: WorkspaceConfig | None) -> str:
+    """Build a parenthesized suffix showing workspace config details.
+
+    Returns e.g. " (model: opus, budget: $15.00)" or "" if no config.
+    """
+    extras = []
+    if ws_config and ws_config.model:
+        extras.append(f"model: {ws_config.model}")
+    if ws_config and ws_config.budget is not None:
+        extras.append(f"budget: ${ws_config.budget:.2f}")
+    return f" ({', '.join(extras)})" if extras else ""
+
+
+async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: Path) -> WorkspaceConfig | None:
     """
     Core workspace switch logic shared by command and callback handlers.
 
     Kills the Claude process (it will restart in the new directory on next
     message), clears the session, and persists the new workspace to settings.
-    Switching to home deletes the setting (home is the default).
+    Switching to home deletes the setting (home is the default). Looks up
+    per-workspace config from workspaces.yaml and passes it to Claude.
+
+    Returns the WorkspaceConfig for the target workspace (or None) so
+    callers can display config details without a redundant lookup.
     """
     claude = _get_claude(context)
     config: Config = context.bot_data["config"]
     home = config.claude_workspace
 
-    await claude.change_workspace(path)
+    # Look up per-workspace config for the target workspace.
+    ws_config = config.get_workspace_config(path)
+    await claude.change_workspace(path, workspace_config=ws_config)
     # Keep the webhook server's confinement path in sync so send-file accepts
     # files from the new workspace rather than rejecting them with 403.
     webhook.update_workspace(str(path))
@@ -793,6 +812,8 @@ async def _do_switch_workspace(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     else:
         await sessions.set_setting("workspace", str(path))
         await sessions.upsert_workspace_history(str(path))
+
+    return ws_config
 
 
 async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, path: Path) -> None:
@@ -811,19 +832,21 @@ async def _switch_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("Already in that workspace.")
         return
 
-    await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
+
+    config_suffix = _workspace_config_suffix(ws_config)
 
     if path == home:
-        await update.message.reply_text("Switched to home workspace. Session cleared.")
+        await update.message.reply_text(f"Switched to home workspace{config_suffix}. Session cleared.")
     else:
-        # Show useful metadata about the workspace
+        # Show filesystem metadata alongside config details
         notes = []
         if (path / ".git").is_dir():
             notes.append("Git repo")
         if (path / ".claude" / "CLAUDE.md").exists():
             notes.append("Has CLAUDE.md")
-        suffix = f" ({', '.join(notes)})" if notes else ""
-        await update.message.reply_text(f"Workspace: {path}{suffix}\nSession cleared.")
+        note_suffix = f" ({', '.join(notes)})" if notes else ""
+        await update.message.reply_text(f"Workspace: {path}{note_suffix}{config_suffix}\nSession cleared.")
 
 
 async def _workspaces_keyboard(
@@ -995,11 +1018,12 @@ async def handle_workspace_callback(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("No change.", reply_markup=InlineKeyboardMarkup([]))
         return
 
-    # Switch and confirm
+    # Switch and confirm, showing any per-workspace config details
     await query.answer()
-    await _do_switch_workspace(context, _chat_id(update), path)
+    ws_config = await _do_switch_workspace(context, _chat_id(update), path)
+    suffix = _workspace_config_suffix(ws_config)
     await query.edit_message_text(
-        f"Switched to {label}. Session cleared.",
+        f"Switched to {label}{suffix}. Session cleared.",
         reply_markup=InlineKeyboardMarkup([]),
     )
 
@@ -1871,6 +1895,9 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
 
     app = builder.build()
     app.bot_data["config"] = config
+    # Apply per-workspace config for the startup workspace (if any).
+    initial_ws_config = config.get_workspace_config(config.claude_workspace)
+
     app.bot_data["claude"] = PersistentClaude(
         model=config.claude_model,
         workspace=config.claude_workspace,
@@ -1882,6 +1909,7 @@ def create_bot(config: Config, *, use_webhook: bool = True) -> Application:
         services_info=services.get_available_services(),
         claude_user=config.claude_user,
         max_session_hours=config.claude_max_session_hours,
+        workspace_config=initial_ws_config,
     )
 
     # Command handlers (alphabetical registration, but order doesn't matter for commands)
