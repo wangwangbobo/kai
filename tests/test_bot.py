@@ -34,6 +34,7 @@ from kai.bot import (
     _save_to_workspace,
     _set_responding,
     _short_workspace_name,
+    _switch_workspace,
     _truncate_for_telegram,
     _voices_keyboard,
     _workspace_config_suffix,
@@ -1192,10 +1193,12 @@ class TestHandleWorkspace:
         assert "Home" in reply or "workspace" in reply.lower()
 
     @pytest.mark.asyncio
-    async def test_home_switches(self):
+    async def test_home_switches(self, tmp_path):
         """'home' keyword switches to home workspace."""
+        home = tmp_path / "home"
+        home.mkdir()
         claude = _make_mock_claude(workspace=Path("/other"))
-        config = _make_config(claude_workspace=Path("/home/workspace"))
+        config = _make_config(claude_workspace=home)
         update = _make_update()
         ctx = _make_context(claude=claude, config=config, args=["home"])
         with (
@@ -1613,13 +1616,29 @@ class TestSwitchWorkspaceConfig:
             patch("kai.bot.sessions", new_callable=AsyncMock),
             patch("kai.bot.webhook"),
         ):
-            from kai.bot import _switch_workspace
-
             await _switch_workspace(update, ctx, ws_path.resolve())
 
         reply_text = update.message.reply_text.call_args[0][0]
         assert "model: opus" in reply_text
         assert "budget: $20.00" in reply_text
+
+    @pytest.mark.asyncio
+    async def test_switch_deleted_directory(self, tmp_path):
+        """Switching to a workspace whose directory no longer exists shows an error."""
+        home = tmp_path / "home"
+        home.mkdir()
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        gone.rmdir()  # create then delete so the path is guaranteed absent
+
+        config = _make_config(claude_workspace=home)
+        claude = _make_mock_claude(workspace=home)
+        update = _make_update()
+        ctx = _make_context(config=config, claude=claude)
+
+        await _switch_workspace(update, ctx, gone)
+
+        update.message.reply_text.assert_called_with("That workspace no longer exists.")
 
 
 # ── handle_message (non-TOTP) ────────────────────────────────────────
