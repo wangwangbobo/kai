@@ -414,8 +414,10 @@ class PersistentClaude:
             if ws_prompt:
                 parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
-            # Inject recent conversation history for continuity
-            recent = get_recent_history()
+            # Inject recent conversation history for continuity.
+            # Filter by chat_id so each user's session only sees their
+            # own messages (Phase 2 per-user data isolation).
+            recent = get_recent_history(chat_id=chat_id)
             if recent:
                 parts.append(f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}")
 
@@ -451,6 +453,7 @@ class PersistentClaude:
                     f'Required: "text" (the message content). '
                     f"Long messages are automatically split at Telegram's 4096-char limit.]"
                 )
+                files_path = f"{self.workspace}/files/{chat_id}/" if chat_id else f"{self.workspace}/files/"
                 parts.append(
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
@@ -459,8 +462,7 @@ class PersistentClaude:
                     f'Optional: "caption". Images are sent as photos, '
                     f"everything else as documents.\n"
                     f"Incoming files from the user are auto-saved to "
-                    f"{self.workspace}/files/ and their paths are included "
-                    f"in the message.]"
+                    f"{files_path} and their paths are included in the message.]"
                 )
 
             # Inject available external services info (only if services are configured)

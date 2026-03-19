@@ -74,7 +74,7 @@ def log_message(
         log.exception("Failed to write chat log")
 
 
-def get_recent_history() -> str:
+def get_recent_history(chat_id: int | None = None) -> str:
     """
     Return a formatted summary of recent messages, scanning back as needed.
 
@@ -85,6 +85,17 @@ def get_recent_history() -> str:
     Injected into the first prompt of each new Claude session (in claude.py)
     to give Kai ambient awareness of recent conversations without loading the
     full history. Long messages are truncated and the total count is capped.
+
+    Args:
+        chat_id: When provided, only include messages from this chat.
+            When None, include all messages (backward-compatible for
+            single-user deployments).
+
+    Note: pre-Phase-2 records (no chat_id field) are included for all
+    users since there is no way to determine which user they belong to
+    without threading the admin's chat_id through PersistentClaude.
+    Phase 3 per-user subprocess isolation eliminates shared history
+    entirely, making this a non-issue.
 
     Returns:
         A newline-separated string of formatted messages like
@@ -113,7 +124,14 @@ def get_recent_history() -> str:
         for line in raw.splitlines():
             if line.strip():
                 try:
-                    file_messages.append(json.loads(line))
+                    record = json.loads(line)
+                    # Skip messages from other users when filtering.
+                    # Records without a chat_id field predate Phase 2
+                    # and are included for all users (see docstring note).
+                    record_chat_id = record.get("chat_id")
+                    if chat_id is not None and record_chat_id is not None and record_chat_id != chat_id:
+                        continue
+                    file_messages.append(record)
                 except json.JSONDecodeError:
                     # Skip individual bad lines rather than discarding the whole file
                     log.debug("Skipping malformed JSON line in %s: %s", path.name, line[:100])
