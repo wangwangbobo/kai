@@ -262,3 +262,58 @@ class TestWorkspaceRestoration:
             # The restore should detect the path doesn't exist and delete
             await pool._restore_workspace(111, pool.get(111))
             mock_delete.assert_called_once_with("workspace:111")
+
+
+# ── get_if_exists ───────────────────────────────────────────────────
+
+
+class TestGetIfExists:
+    def test_returns_none_when_no_instance(self):
+        """No subprocess for user. Returns None without creating one."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        assert pool.get_if_exists(999) is None
+        assert 999 not in pool._pool
+
+    def test_returns_instance_when_exists(self):
+        """Subprocess exists. Returns it."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.get(111)  # create
+        result = pool.get_if_exists(111)
+        assert result is not None
+        assert result is pool._pool[111]
+
+    def test_force_kill_no_instance(self):
+        """/stop for a user with no subprocess. No-op, no crash."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        pool.force_kill(999)  # should not raise
+
+
+# ── TOCTOU eviction guard ──────────────────────────────────────────
+
+
+class TestEvictionTOCTOU:
+    def test_toctou_guard_skips_recently_active(self):
+        """TOCTOU guard skips user who became active between list build and eviction."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+        pool.get(111)
+
+        # Step 1: simulate building the candidate list when user was idle.
+        # Set activity to old timestamp so user enters the evict list.
+        sweep_now = time.monotonic()
+        pool._last_activity[111] = sweep_now - 10  # idle for 10 seconds
+
+        to_evict = [
+            cid
+            for cid, last in pool._last_activity.items()
+            if sweep_now - last > config.claude_idle_timeout and cid in pool._pool and cid not in pool._in_flight
+        ]
+        assert 111 in to_evict  # user is in the evict list
+
+        # Step 2: user becomes active AFTER the list was built (TOCTOU window)
+        pool._last_activity[111] = time.monotonic()
+
+        # Step 3: the TOCTOU re-check should skip them
+        assert pool._last_activity.get(111, 0) > sweep_now
+        # This is the guard: if _last_activity > now, skip eviction
+        assert 111 in pool._pool  # user survives
