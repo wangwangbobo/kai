@@ -445,6 +445,30 @@ async def upsert_workspace_history(path: str, chat_id: int) -> None:
     await _get_db().commit()
 
 
+async def get_all_workspace_paths(limit: int = 100) -> list[str]:
+    """
+    Get distinct workspace paths across all users, most recently used first.
+
+    Used by _resolve_local_repo() to match GitHub repos against any user's
+    workspace history, since webhook routing has no user context.
+
+    Args:
+        limit: Maximum number of paths to return (default 100).
+
+    Returns:
+        List of workspace path strings (deduplicated across users).
+    """
+    # GROUP BY + MAX(last_used_at) instead of DISTINCT to get
+    # deterministic ordering when the same path appears for multiple
+    # users with different timestamps.
+    async with _get_db().execute(
+        "SELECT path FROM workspace_history GROUP BY path ORDER BY MAX(last_used_at) DESC LIMIT ?",
+        (limit,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+
 async def get_workspace_history(chat_id: int, limit: int = 10) -> list[dict]:
     """
     Get recent workspace paths for a specific user.
