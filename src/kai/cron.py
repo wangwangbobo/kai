@@ -351,3 +351,8 @@ async def _job_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
                 job.schedule_removal()
             except Exception:
                 log.exception("Failed to send job %d result", job_id)
+        # One-shot Claude jobs auto-deactivate after firing.
+        # No schedule_removal() needed here - APScheduler's run_once already
+        # removes the job from the queue after it fires.
+        if data["schedule_type"] == "once" and data.get("job_type") == "claude":
+            await sessions.deactivate_job(job_id)
