@@ -915,7 +915,7 @@ class TestApplyMigrate:
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (data_path / "kai.db").exists()
         assert (data_path / "kai.db").read_text() == "fake-db-content"
@@ -941,7 +941,7 @@ class TestApplyMigrate:
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Find the sqlite3 call
         sqlite_calls = [c for c in calls if "sqlite3" in c[0]]
@@ -959,7 +959,7 @@ class TestApplyMigrate:
         (data_path / "logs").mkdir()
         (data_path / "kai.db").write_text("existing-content")
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Destination should be unchanged
         assert (data_path / "kai.db").read_text() == "existing-content"
@@ -982,7 +982,7 @@ class TestApplyMigrate:
         # Mock os.chown for ownership setting
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (logs_dst / "kai.log").read_text() == "log1"
         assert (logs_dst / "kai.log.1").read_text() == "log2"
@@ -1006,7 +1006,7 @@ class TestApplyMigrate:
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Source files must still exist
         assert (tmp_path / "src" / "kai.db").exists()
@@ -1025,7 +1025,7 @@ class TestApplyMigrate:
         data_path.mkdir()
         (data_path / "logs").mkdir()
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=True)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=True)
 
         output = capsys.readouterr().out
         assert "[DRY RUN]" in output
@@ -1049,7 +1049,7 @@ class TestApplyMigrate:
 
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (history_dst / "2026-03-20.jsonl").exists()
         assert (history_dst / "2026-03-21.jsonl").exists()
@@ -1070,7 +1070,7 @@ class TestApplyMigrate:
         history_dst.mkdir()
         (history_dst / "2026-03-20.jsonl").write_text("existing content")
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Destination unchanged
         assert (history_dst / "2026-03-20.jsonl").read_text() == "existing content"
@@ -1091,7 +1091,7 @@ class TestApplyMigrate:
 
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         memory_dst = data_path / "memory" / "MEMORY.md"
         assert memory_dst.exists()
@@ -1114,9 +1114,80 @@ class TestApplyMigrate:
         memory_dir.mkdir()
         (memory_dir / "MEMORY.md").write_text("existing personalized content")
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
+
+    def test_copies_uploaded_files(self, tmp_path, monkeypatch):
+        """Copies uploaded files from home/files/ to data_path/files/."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files" / "123"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"image data")
+        (files_src / "doc.pdf").write_bytes(b"pdf data")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "files").mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (data_path / "files" / "123" / "photo.jpg").read_bytes() == b"image data"
+        assert (data_path / "files" / "123" / "doc.pdf").read_bytes() == b"pdf data"
+        # Source files preserved
+        assert (files_src / "photo.jpg").exists()
+
+    def test_uploaded_files_skip_existing(self, tmp_path, monkeypatch):
+        """Does not overwrite uploaded files that already exist at the destination."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"source")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        files_dst = data_path / "files"
+        files_dst.mkdir()
+        (files_dst / "photo.jpg").write_bytes(b"existing")
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (files_dst / "photo.jpg").read_bytes() == b"existing"
+
+    def test_uploaded_files_dry_run(self, tmp_path, monkeypatch, capsys):
+        """Dry run prints file migration actions without copying."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"image data")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "files").mkdir()
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN] Would copy file:" in output
+        assert "Would migrate 1 uploaded file(s)" in output
+        # Nothing should have been copied
+        assert not (data_path / "files" / "photo.jpg").exists()
 
 
 # ── Service lifecycle ────────────────────────────────────────────────
