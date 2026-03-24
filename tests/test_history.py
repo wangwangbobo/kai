@@ -163,3 +163,13 @@ class TestGetRecentHistory:
         assert "old2" in result
         # old1 should be excluded (it's the 4th oldest, beyond the cap)
         assert "old1" not in result
+
+
+def test_log_dir_uses_data_dir():
+    """Verify history module imports DATA_DIR, not PROJECT_ROOT."""
+    import inspect
+
+    source = inspect.getsource(__import__("kai.history", fromlist=["_LOG_DIR"]))
+    # The module should use DATA_DIR for _LOG_DIR, not PROJECT_ROOT
+    assert "DATA_DIR" in source
+    assert '_LOG_DIR = DATA_DIR / "history"' in source

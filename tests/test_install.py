@@ -1033,6 +1033,91 @@ class TestApplyMigrate:
         assert not (data_path / "kai.db").exists()
         assert not (data_path / "logs" / "kai.log").exists()
 
+    def test_copies_history(self, tmp_path, monkeypatch):
+        """Copies JSONL history files from workspace/.claude/history/ to data_path/history/."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        history_src = tmp_path / "src" / "workspace" / ".claude" / "history"
+        history_src.mkdir(parents=True)
+        (history_src / "2026-03-20.jsonl").write_text('{"ts":"2026-03-20","text":"hello"}')
+        (history_src / "2026-03-21.jsonl").write_text('{"ts":"2026-03-21","text":"world"}')
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        history_dst = data_path / "history"
+        history_dst.mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (history_dst / "2026-03-20.jsonl").exists()
+        assert (history_dst / "2026-03-21.jsonl").exists()
+        # Source files preserved
+        assert (history_src / "2026-03-20.jsonl").exists()
+
+    def test_history_skips_existing(self, tmp_path, monkeypatch, capsys):
+        """Does not overwrite history files that already exist at the destination."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        history_src = tmp_path / "src" / "workspace" / ".claude" / "history"
+        history_src.mkdir(parents=True)
+        (history_src / "2026-03-20.jsonl").write_text("source content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        history_dst = data_path / "history"
+        history_dst.mkdir()
+        (history_dst / "2026-03-20.jsonl").write_text("existing content")
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        # Destination unchanged
+        assert (history_dst / "2026-03-20.jsonl").read_text() == "existing content"
+        output = capsys.readouterr().out
+        assert "already migrated" in output
+
+    def test_copies_memory(self, tmp_path, monkeypatch, capsys):
+        """Copies MEMORY.md from workspace/.claude/ to data_path/memory/."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "workspace" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("User prefers dry humor.")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        memory_dst = data_path / "memory" / "MEMORY.md"
+        assert memory_dst.exists()
+        assert memory_dst.read_text() == "User prefers dry humor."
+        # Source preserved
+        assert (claude_dir / "MEMORY.md").exists()
+        assert "Migrated MEMORY.md" in capsys.readouterr().out
+
+    def test_memory_skips_existing(self, tmp_path, monkeypatch):
+        """Does not overwrite MEMORY.md that already exists at the destination."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "workspace" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("old content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        memory_dir = data_path / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("existing personalized content")
+
+        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
+
 
 # ── Service lifecycle ────────────────────────────────────────────────
 
@@ -1234,17 +1319,48 @@ class TestCopyTree:
         assert (dst / "file.py").exists()
         assert not (dst / "__pycache__").exists()
 
-    def test_overwrites_existing(self, tmp_path):
-        """Existing destination is removed before copy."""
+    def test_preserves_destination_only_files(self, tmp_path: Path) -> None:
+        """Files at destination that don't exist in source survive the copy."""
         src = tmp_path / "src"
         src.mkdir()
         (src / "new.py").write_text("new")
+
         dst = tmp_path / "dst"
         dst.mkdir()
-        (dst / "old.py").write_text("old")
+        (dst / "runtime_data.txt").write_text("must survive")
+
         _copy_tree(src, dst)
-        assert (dst / "new.py").exists()
-        assert not (dst / "old.py").exists()
+
+        assert (dst / "new.py").read_text() == "new"
+        assert (dst / "runtime_data.txt").read_text() == "must survive"
+
+    def test_overwrites_matching_files(self, tmp_path: Path) -> None:
+        """Source files overwrite same-named destination files."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "config.py").write_text("updated")
+
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        (dst / "config.py").write_text("old version")
+
+        _copy_tree(src, dst)
+
+        assert (dst / "config.py").read_text() == "updated"
+
+    def test_excludes_nested_directories(self, tmp_path: Path) -> None:
+        """Excluded directories are not descended into or copied."""
+        src = tmp_path / "src"
+        (src / "keep").mkdir(parents=True)
+        (src / "keep" / "file.txt").write_text("kept")
+        (src / "skip" / "sub").mkdir(parents=True)
+        (src / "skip" / "sub" / "deep.txt").write_text("should not appear")
+
+        dst = tmp_path / "dst"
+        _copy_tree(src, dst, excludes={"skip"})
+
+        assert (dst / "keep" / "file.txt").read_text() == "kept"
+        assert not (dst / "skip").exists()
 
 
 # ── _user_home ───────────────────────────────────────────────────────
