@@ -803,12 +803,18 @@ async def _send_error_notification(
         "X-Webhook-Secret": webhook_secret,
     }
 
-    async with (
-        aiohttp.ClientSession() as session,
-        session.post(url, json={"text": text}, headers=headers) as resp,
-    ):
-        if resp.status != 200:
-            log.warning(
-                "send-message API returned %d for triage error notification",
-                resp.status,
-            )
+    try:
+        async with (
+            aiohttp.ClientSession() as session,
+            session.post(url, json={"text": text}, headers=headers) as resp,
+        ):
+            if resp.status != 200:
+                log.warning(
+                    "send-message API returned %d for triage error notification",
+                    resp.status,
+                )
+    except Exception as e:
+        log.warning(
+            "send-message API request failed: %s",
+            e,
+        )
