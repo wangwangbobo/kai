@@ -11,6 +11,7 @@ Covers:
 7. Shutdown
 """
 
+import asyncio
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -86,16 +87,17 @@ class TestInstanceCreation:
 
 
 class TestPerUserActions:
-    def test_force_kill_specific_user(self):
-        """force_kill(A) kills A's process, B's is unaffected."""
+    @pytest.mark.asyncio
+    async def test_force_kill_specific_user(self):
+        """force_kill(A) shuts down A's process, B's is unaffected."""
         pool = SubprocessPool(config=_make_config(), services_info=[])
         a = pool.get(111)
         b = pool.get(222)
         with (
-            patch.object(a, "force_kill") as mock_a,
-            patch.object(b, "force_kill") as mock_b,
+            patch.object(a, "shutdown", new_callable=AsyncMock) as mock_a,
+            patch.object(b, "shutdown", new_callable=AsyncMock) as mock_b,
         ):
-            pool.force_kill(111)
+            await pool.force_kill(111)
             mock_a.assert_called_once()
             mock_b.assert_not_called()
 
@@ -282,10 +284,70 @@ class TestGetIfExists:
         assert result is not None
         assert result is pool._pool[111]
 
-    def test_force_kill_no_instance(self):
+    @pytest.mark.asyncio
+    async def test_force_kill_no_instance(self):
         """/stop for a user with no subprocess. No-op, no crash."""
         pool = SubprocessPool(config=_make_config(), services_info=[])
-        pool.force_kill(999)  # should not raise
+        await pool.force_kill(999)  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_force_kill_shutdown_timeout_falls_back(self):
+        """When shutdown() hangs, falls back to raw force_kill."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+
+        # Make shutdown hang forever
+        async def hang_forever():
+            await asyncio.sleep(999)
+
+        with (
+            patch("kai.pool._FORCE_KILL_TIMEOUT", 0.01),
+            patch.object(instance, "shutdown", side_effect=hang_forever),
+            patch.object(instance, "force_kill") as mock_raw_kill,
+        ):
+            await pool.force_kill(111)
+            mock_raw_kill.assert_called_once()
+
+        # Instance should be removed from pool after SIGKILL fallback
+        assert 111 not in pool._pool
+
+    @pytest.mark.asyncio
+    async def test_force_kill_catches_non_timeout_exceptions(self):
+        """force_kill catches any exception from shutdown, not just TimeoutError."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+
+        with (
+            patch.object(instance, "shutdown", side_effect=RuntimeError("unexpected")),
+            patch.object(instance, "force_kill") as mock_raw_kill,
+        ):
+            # Should not propagate the exception to the caller
+            await pool.force_kill(111)
+            mock_raw_kill.assert_called_once()
+
+        # Instance removed from pool after fallback
+        assert 111 not in pool._pool
+        assert 111 not in pool._last_activity
+
+    @pytest.mark.asyncio
+    async def test_force_kill_pops_after_successful_shutdown(self):
+        """Instance is removed from pool only after shutdown succeeds."""
+        pool = SubprocessPool(config=_make_config(), services_info=[])
+        instance = pool.get(111)
+
+        popped_during_shutdown = []
+
+        async def check_pool_during_shutdown():
+            # During shutdown, instance should still be in the pool
+            popped_during_shutdown.append(111 in pool._pool)
+
+        with patch.object(instance, "shutdown", side_effect=check_pool_during_shutdown):
+            await pool.force_kill(111)
+
+        # Instance was in pool during shutdown
+        assert popped_during_shutdown == [True]
+        # Instance removed after shutdown completed
+        assert 111 not in pool._pool
 
 
 # ── TOCTOU eviction guard ──────────────────────────────────────────
@@ -317,3 +379,202 @@ class TestEvictionTOCTOU:
         assert pool._last_activity.get(111, 0) > sweep_now
         # This is the guard: if _last_activity > now, skip eviction
         assert 111 in pool._pool  # user survives
+
+    @pytest.mark.asyncio
+    async def test_toctou_guard_skips_in_flight(self):
+        """TOCTOU guard skips user who entered send() between snapshot and eviction."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+
+        # Two idle users: A's shutdown is the yield point, B gets the TOCTOU change.
+        # get() order determines to_evict order (dict insertion order); 111 must
+        # be processed first so its shutdown side effect modifies 222's state.
+        a = pool.get(111)
+        pool.get(222)
+        pool._last_activity[111] = time.monotonic() - 10
+        pool._last_activity[222] = time.monotonic() - 10
+
+        async def a_shutdown_adds_b_in_flight():
+            # Simulate user 222 entering send() during A's shutdown
+            pool._in_flight.add(222)
+
+        sleep_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        # Set _proc so is_alive returns True (it checks _proc.returncode)
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        a._proc = mock_proc
+
+        with (
+            patch.object(a, "shutdown", side_effect=a_shutdown_adds_b_in_flight),
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # A was evicted (first in the loop, before the TOCTOU change)
+        assert 111 not in pool._pool
+        # B survived (in-flight re-check caught the change)
+        assert 222 in pool._pool
+
+    @pytest.mark.asyncio
+    async def test_toctou_guard_skips_removed_from_pool(self):
+        """TOCTOU guard skips user removed from pool between snapshot and eviction."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+
+        # get() order determines to_evict order (dict insertion order); 111 must
+        # be processed first so its shutdown side effect modifies 222's state.
+        a = pool.get(111)
+        pool.get(222)
+        pool._last_activity[111] = time.monotonic() - 10
+        pool._last_activity[222] = time.monotonic() - 10
+
+        async def a_shutdown_removes_b():
+            # Simulate force_kill removing user 222 during A's shutdown
+            pool._pool.pop(222, None)
+
+        sleep_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        a._proc = mock_proc
+
+        with (
+            patch.object(a, "shutdown", side_effect=a_shutdown_removes_b),
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # A was evicted
+        assert 111 not in pool._pool
+        # B's _last_activity was cleaned up by the pool-membership guard
+        assert 222 not in pool._last_activity
+
+    @pytest.mark.asyncio
+    async def test_eviction_proceeds_when_all_checks_pass(self):
+        """User passing all three re-checks is evicted normally."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+
+        instance = pool.get(111)
+        pool._last_activity[111] = time.monotonic() - 10
+
+        sleep_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        instance._proc = mock_proc
+
+        with (
+            patch.object(instance, "shutdown", new_callable=AsyncMock),
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # User was evicted: removed from pool and last_activity
+        assert 111 not in pool._pool
+        assert 111 not in pool._last_activity
+
+    @pytest.mark.asyncio
+    async def test_eviction_failure_triggers_sigkill_fallback(self):
+        """Failed shutdown() in eviction loop triggers force_kill fallback."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+
+        instance = pool.get(111)
+        pool._last_activity[111] = time.monotonic() - 10
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        instance._proc = mock_proc
+
+        sleep_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch.object(instance, "shutdown", side_effect=RuntimeError("crash")),
+            patch.object(instance, "force_kill") as mock_raw_kill,
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # SIGKILL fallback was called
+        mock_raw_kill.assert_called_once()
+        # Instance was removed from pool after fallback (not orphaned)
+        assert 111 not in pool._pool
+        assert 111 not in pool._last_activity
+
+    @pytest.mark.asyncio
+    async def test_eviction_pops_after_shutdown(self):
+        """Instance stays in pool during shutdown, removed only after success."""
+        config = _make_config(claude_idle_timeout=1)
+        pool = SubprocessPool(config=config, services_info=[])
+
+        instance = pool.get(111)
+        pool._last_activity[111] = time.monotonic() - 10
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        instance._proc = mock_proc
+
+        in_pool_during_shutdown = []
+
+        async def check_pool():
+            in_pool_during_shutdown.append(111 in pool._pool)
+
+        sleep_count = 0
+
+        async def mock_sleep(_duration):
+            nonlocal sleep_count
+            sleep_count += 1
+            if sleep_count > 1:
+                raise asyncio.CancelledError
+
+        with (
+            patch.object(instance, "shutdown", side_effect=check_pool),
+            patch("kai.pool.asyncio.sleep", side_effect=mock_sleep),
+        ):
+            try:
+                await pool._eviction_loop()
+            except asyncio.CancelledError:
+                pass
+
+        # Instance was in pool during shutdown
+        assert in_pool_during_shutdown == [True]
+        # Removed after shutdown completed
+        assert 111 not in pool._pool

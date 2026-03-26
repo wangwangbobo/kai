@@ -2,6 +2,7 @@
 
 import json
 import re
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -527,6 +528,7 @@ class TestRunReview:
     async def test_timeout_raises(self):
         """Hanging subprocess is killed and raises RuntimeError."""
         mock_proc = AsyncMock()
+        mock_proc.pid = 12345
         # communicate's return value doesn't matter here - wait_for is
         # patched to raise TimeoutError before communicate is ever called.
         mock_proc.kill = MagicMock()
@@ -539,9 +541,50 @@ class TestRunReview:
         ):
             await run_review("review this code")
 
-        # Verify the process was killed
+        # Without claude_user, kills the process directly
         mock_proc.kill.assert_called_once()
         mock_proc.wait.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_with_claude_user_kills_group(self):
+        """Timeout with claude_user kills the process group, not just sudo."""
+        mock_proc = AsyncMock()
+        mock_proc.pid = 12345
+        mock_proc.wait = AsyncMock()
+
+        with (
+            patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc),
+            patch("kai.review.asyncio.wait_for", side_effect=TimeoutError()),
+            patch("kai.review.os.killpg") as mock_killpg,
+            pytest.raises(RuntimeError, match="timed out"),
+        ):
+            await run_review("review this code", claude_user="kai")
+
+        # With claude_user, kills the entire process group
+        mock_killpg.assert_called_once_with(12345, signal.SIGKILL)
+        mock_proc.wait.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_claude_user_starts_new_session(self):
+        """claude_user spawns with start_new_session=True for group kill."""
+        mock_proc = _mock_process(stdout=b"review output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt", claude_user="kai")
+
+        kwargs = mock_exec.call_args[1]
+        assert kwargs.get("start_new_session") is True
+
+    @pytest.mark.asyncio
+    async def test_no_claude_user_no_new_session(self):
+        """Without claude_user, start_new_session is False."""
+        mock_proc = _mock_process(stdout=b"review output")
+
+        with patch("kai.review.asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            await run_review("prompt")
+
+        kwargs = mock_exec.call_args[1]
+        assert kwargs.get("start_new_session") is False
 
     @pytest.mark.asyncio
     async def test_with_claude_user(self):
@@ -945,58 +988,58 @@ class TestResolveSpecFromBody:
 class TestResolveSpecFromBranch:
     def test_found(self, tmp_path):
         """Finds a spec file matching the branch name fragment."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
         spec_file = specs_dir / "issue-54-pr-review-routing.md"
         spec_file.write_text("spec content")
 
-        result = resolve_spec_from_branch("feature/pr-review-routing", str(tmp_path), spec_dir="workspace/specs")
+        result = resolve_spec_from_branch("feature/pr-review-routing", str(tmp_path), spec_dir="home/specs")
         assert result == str(spec_file)
 
     def test_no_match(self, tmp_path):
         """Returns None when no spec files match the branch name."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
         (specs_dir / "unrelated-spec.md").write_text("content")
 
-        result = resolve_spec_from_branch("feature/something-else", str(tmp_path), spec_dir="workspace/specs")
+        result = resolve_spec_from_branch("feature/something-else", str(tmp_path), spec_dir="home/specs")
         assert result is None
 
     def test_no_specs_dir(self, tmp_path):
         """Returns None when the spec directory does not exist."""
-        result = resolve_spec_from_branch("feature/anything", str(tmp_path), spec_dir="workspace/specs")
+        result = resolve_spec_from_branch("feature/anything", str(tmp_path), spec_dir="home/specs")
         assert result is None
 
     def test_strips_prefix(self, tmp_path):
         """Strips everything before the first '/' before matching."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
         spec_file = specs_dir / "some-bug-fix.md"
         spec_file.write_text("content")
 
         for prefix in ("fix", "docs", "custom"):
-            assert resolve_spec_from_branch(f"{prefix}/some-bug-fix", str(tmp_path), spec_dir="workspace/specs") == str(
+            assert resolve_spec_from_branch(f"{prefix}/some-bug-fix", str(tmp_path), spec_dir="home/specs") == str(
                 spec_file
             )
 
     def test_no_prefix_branch(self, tmp_path):
         """Branches without a '/' are used as-is for matching."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
         spec_file = specs_dir / "my-branch-spec.md"
         spec_file.write_text("content")
 
-        result = resolve_spec_from_branch("my-branch", str(tmp_path), spec_dir="workspace/specs")
+        result = resolve_spec_from_branch("my-branch", str(tmp_path), spec_dir="home/specs")
         assert result == str(spec_file)
 
     def test_first_match_sorted(self, tmp_path):
         """When multiple specs match, returns the first alphabetically."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
         (specs_dir / "a-routing.md").write_text("a")
         (specs_dir / "b-routing.md").write_text("b")
 
-        result = resolve_spec_from_branch("feature/routing", str(tmp_path), spec_dir="workspace/specs")
+        result = resolve_spec_from_branch("feature/routing", str(tmp_path), spec_dir="home/specs")
         assert result == str(specs_dir / "a-routing.md")
 
     def test_default_dir(self, tmp_path):
@@ -1009,6 +1052,59 @@ class TestResolveSpecFromBranch:
         result = resolve_spec_from_branch("feature/my-spec", str(tmp_path))
         assert result == str(spec_file)
 
+    def test_glob_metachar_star_escaped(self, tmp_path):
+        """Glob * in branch name is escaped, doesn't match everything."""
+        specs_dir = tmp_path / "home" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "unrelated-spec.md").write_text("should not match")
+
+        # Branch name contains *, which unescaped would match all .md files
+        result = resolve_spec_from_branch("feature/*", str(tmp_path), spec_dir="home/specs")
+        assert result is None
+
+    def test_glob_metachar_question_escaped(self, tmp_path):
+        """Glob ? in branch name is escaped, doesn't match single chars."""
+        specs_dir = tmp_path / "home" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "test-spec.md").write_text("content")
+
+        # "t?st" unescaped would match "test", but escaped it's literal
+        result = resolve_spec_from_branch("feature/t?st", str(tmp_path), spec_dir="home/specs")
+        assert result is None
+
+    def test_glob_metachar_bracket_escaped(self, tmp_path):
+        """Glob [] in branch name is escaped, doesn't match char classes."""
+        specs_dir = tmp_path / "home" / "specs"
+        specs_dir.mkdir(parents=True)
+        (specs_dir / "spec1.md").write_text("content")
+
+        # "spec[0-9]" unescaped would match "spec1", but escaped it's literal
+        result = resolve_spec_from_branch("feature/spec[0-9]", str(tmp_path), spec_dir="home/specs")
+        assert result is None
+
+    def test_normal_branch_still_matches_after_escaping(self, tmp_path):
+        """Normal branch names (no metacharacters) still match after escaping."""
+        specs_dir = tmp_path / "home" / "specs"
+        specs_dir.mkdir(parents=True)
+        spec_file = specs_dir / "add-user-auth.md"
+        spec_file.write_text("content")
+
+        result = resolve_spec_from_branch("feature/add-user-auth", str(tmp_path), spec_dir="home/specs")
+        assert result == str(spec_file)
+
+    def test_literal_bracket_in_filename_still_matches(self, tmp_path):
+        """A spec file with literal [ in its name matches an escaped branch."""
+        specs_dir = tmp_path / "home" / "specs"
+        specs_dir.mkdir(parents=True)
+        # [ is a glob metachar AND a valid filename on all platforms
+        spec_file = specs_dir / "fix-[wip]-auth.md"
+        spec_file.write_text("content")
+
+        # Without escaping, [wip] would be a character class matching w/i/p.
+        # With escaping, it matches the literal [ and ].
+        result = resolve_spec_from_branch("feature/fix-[wip]-auth", str(tmp_path), spec_dir="home/specs")
+        assert result == str(spec_file)
+
 
 # ── load_spec ──────────────────────────────────────────────────────
 
@@ -1017,42 +1113,42 @@ class TestLoadSpec:
     @pytest.mark.asyncio
     async def test_body_marker_priority(self, tmp_path):
         """Body marker takes priority over branch name matching."""
-        spec_from_body = tmp_path / "workspace" / "specs" / "explicit.md"
+        spec_from_body = tmp_path / "home" / "specs" / "explicit.md"
         spec_from_body.parent.mkdir(parents=True)
         spec_from_body.write_text("body spec content")
 
-        spec_from_branch = tmp_path / "workspace" / "specs" / "branch-match.md"
+        spec_from_branch = tmp_path / "home" / "specs" / "branch-match.md"
         spec_from_branch.write_text("branch spec content")
 
         meta = _metadata(
-            description="spec: workspace/specs/explicit.md",
+            description="spec: home/specs/explicit.md",
             branch="feature/branch-match",
         )
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="home/specs")
         assert result == "body spec content"
 
     @pytest.mark.asyncio
     async def test_falls_back_to_branch(self, tmp_path):
         """Uses branch name matching when no body marker is present."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
         (specs_dir / "issue-99-my-feature.md").write_text("branch spec")
 
         meta = _metadata(description="No spec marker here.", branch="feature/my-feature")
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="home/specs")
         assert result == "branch spec"
 
     @pytest.mark.asyncio
     async def test_no_spec_found(self, tmp_path):
         """Returns None when neither strategy finds a spec."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
 
         meta = _metadata(description="No spec.", branch="feature/no-match")
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="home/specs")
         assert result is None
 
     @pytest.mark.asyncio
@@ -1065,7 +1161,7 @@ class TestLoadSpec:
     @pytest.mark.asyncio
     async def test_body_marker_file_missing(self, tmp_path):
         """Falls back to branch matching when body-referenced file does not exist."""
-        specs_dir = tmp_path / "workspace" / "specs"
+        specs_dir = tmp_path / "home" / "specs"
         specs_dir.mkdir(parents=True)
         (specs_dir / "fallback-spec.md").write_text("fallback content")
 
@@ -1074,7 +1170,7 @@ class TestLoadSpec:
             branch="feature/fallback",
         )
 
-        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="workspace/specs")
+        result = await load_spec(meta, local_repo_path=str(tmp_path), spec_dir="home/specs")
         assert result == "fallback content"
 
     @pytest.mark.asyncio

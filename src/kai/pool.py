@@ -47,6 +47,10 @@ def _is_workspace_allowed(path: Path, config: Config) -> bool:
 # How often the eviction loop checks for idle subprocesses (seconds).
 _EVICTION_CHECK_INTERVAL = 60
 
+# Maximum time to wait for shutdown() in force_kill before falling
+# back to raw SIGKILL (seconds).
+_FORCE_KILL_TIMEOUT = 5
+
 
 class SubprocessPool:
     """
@@ -198,12 +202,38 @@ class SubprocessPool:
         """
         return self._pool.get(chat_id)
 
-    def force_kill(self, chat_id: int) -> None:
-        """Kill a specific user's subprocess and remove it from the pool."""
-        instance = self._pool.pop(chat_id, None)
-        self._last_activity.pop(chat_id, None)
-        if instance:
+    async def force_kill(self, chat_id: int) -> None:
+        """
+        Kill a specific user's subprocess and remove it from the pool.
+
+        Uses shutdown() with a short timeout for clean process reaping
+        and stderr task cancellation. Falls back to raw SIGKILL on any
+        non-cancellation failure (timeout, OSError, etc.). Cleanup
+        (pool removal) runs unconditionally via finally.
+
+        The instance is kept in the pool during shutdown so it remains
+        tracked. It is only removed after the subprocess is confirmed
+        dead (either via clean shutdown or SIGKILL fallback).
+        """
+        instance = self._pool.get(chat_id)
+        if not instance:
+            # No instance to kill; clean up any orphaned tracking entry
+            self._last_activity.pop(chat_id, None)
+            return
+        try:
+            await asyncio.wait_for(instance.shutdown(), timeout=_FORCE_KILL_TIMEOUT)
+        except Exception:
+            # Any failure (timeout, OSError, etc.) - fall back to raw
+            # SIGKILL. instance.force_kill() is effectively infallible
+            # (catches its own OSError).
             instance.force_kill()
+            log.warning("force_kill: shutdown failed for user %d, sent SIGKILL", chat_id)
+        finally:
+            # Remove from tracking regardless of how shutdown ended.
+            # The finally block ensures cleanup even if CancelledError
+            # (a BaseException, not caught by except Exception) propagates.
+            self._pool.pop(chat_id, None)
+            self._last_activity.pop(chat_id, None)
 
     async def change_workspace(
         self,
@@ -271,18 +301,42 @@ class SubprocessPool:
                 if now - last > idle_timeout and chat_id in self._pool and chat_id not in self._in_flight
             ]
             for chat_id in to_evict:
-                # Re-check: activity may have occurred between list
-                # construction and this iteration (TOCTOU window).
+                # Re-check all three snapshot conditions before evicting.
+                # Between the snapshot and this iteration (and between
+                # iterations), await points in shutdown() yield control.
+                # Other coroutines can: refresh activity timestamps,
+                # enter send() (adding to _in_flight), or call
+                # force_kill() (removing from _pool). All three must
+                # be re-verified to avoid evicting active conversations.
+                # Pool membership first: if force_kill() already removed the
+                # instance, clean up the orphaned _last_activity entry and
+                # skip. This must be checked before the timestamp/in-flight
+                # guards so the cleanup always fires when the instance is gone.
+                if chat_id not in self._pool:
+                    self._last_activity.pop(chat_id, None)
+                    continue
                 if self._last_activity.get(chat_id, 0) > now:
                     continue
-                instance = self._pool.pop(chat_id, None)
-                self._last_activity.pop(chat_id, None)
-                if instance and instance.is_alive:
-                    try:
-                        log.info("Evicting idle subprocess for user %d", chat_id)
-                        await instance.shutdown()
-                    except Exception:
-                        log.exception("Error evicting subprocess for user %d", chat_id)
+                if chat_id in self._in_flight:
+                    continue
+                instance = self._pool.get(chat_id)
+                try:
+                    if instance and instance.is_alive:
+                        try:
+                            log.info("Evicting idle subprocess for user %d", chat_id)
+                            await instance.shutdown()
+                        except Exception:
+                            # Graceful shutdown failed. Fall back to raw SIGKILL
+                            # so the process doesn't become an orphan. force_kill()
+                            # is effectively infallible (catches its own OSError).
+                            log.exception("Error evicting subprocess for user %d, sending SIGKILL", chat_id)
+                            instance.force_kill()
+                finally:
+                    # Remove from tracking after shutdown (alive instances) or
+                    # unconditionally (dead instances). The finally block ensures
+                    # cleanup even if CancelledError propagates from shutdown().
+                    self._pool.pop(chat_id, None)
+                    self._last_activity.pop(chat_id, None)
 
     async def shutdown(self) -> None:
         """Shut down all subprocesses and stop the eviction task."""

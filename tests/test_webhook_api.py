@@ -1013,6 +1013,25 @@ class TestScheduleValidation:
         assert job is not None
         assert job["schedule_data"] == '{"seconds": 900}'
 
+    async def test_invalid_string_schedule_data_returns_400(self, db, mock_request):
+        """schedule_data as a non-JSON string is rejected with 400."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad data",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": "not json at all",
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "not valid JSON" in body["error"]
+
     async def test_defaults_for_optional_fields(self, db, mock_request):
         """auto_remove defaults to False when omitted. job_type defaults to 'reminder'."""
         mock_request.headers = {"X-Webhook-Secret": "test-secret"}
@@ -1086,6 +1105,152 @@ class TestScheduleValidation:
         resp = await _handle_schedule(mock_request)
 
         assert resp.status == 400
+
+    async def test_once_missing_run_at_returns_400(self, db, mock_request):
+        """schedule_data for 'once' without 'run_at' is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad once",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"times": ["08:00"]},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "run_at" in body["error"]
+
+    async def test_daily_missing_times_returns_400(self, db, mock_request):
+        """schedule_data for 'daily' without 'times' is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad daily",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"seconds": 60},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "times" in body["error"]
+
+    async def test_interval_missing_seconds_returns_400(self, db, mock_request):
+        """schedule_data for 'interval' without 'seconds' is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad interval",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"run_at": "2026-01-01T00:00:00Z"},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "seconds" in body["error"]
+
+    async def test_interval_negative_seconds_returns_400(self, db, mock_request):
+        """schedule_data with non-positive seconds is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad interval",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": -10},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "positive" in body["error"]
+
+    async def test_daily_invalid_time_format_returns_400(self, db, mock_request):
+        """schedule_data with a malformed time string is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad time",
+                "prompt": "test",
+                "schedule_type": "daily",
+                "schedule_data": {"times": ["25:00"]},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "HH:MM" in body["error"]
+
+    async def test_once_invalid_datetime_returns_400(self, db, mock_request):
+        """schedule_data with an unparseable run_at is rejected."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "bad datetime",
+                "prompt": "test",
+                "schedule_type": "once",
+                "schedule_data": {"run_at": "not-a-date"},
+            }
+        )
+
+        resp = await _handle_schedule(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "ISO datetime" in body["error"]
+
+
+# ── PATCH schedule_data validation ───────────────────────────────
+
+
+class TestUpdateJobScheduleDataValidation:
+    async def test_update_invalid_schedule_data_returns_400(self, db, mock_request):
+        """PATCH with malformed schedule_data is rejected."""
+        # Create a valid job first
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.app["chat_id"] = 123
+        mock_request.json = AsyncMock(
+            return_value={
+                "name": "to update",
+                "prompt": "test",
+                "schedule_type": "interval",
+                "schedule_data": {"seconds": 600},
+            }
+        )
+        with patch("kai.cron.register_job_by_id", new_callable=AsyncMock):
+            resp = await _handle_schedule(mock_request)
+        job_id = json.loads(resp.body.decode())["job_id"]
+
+        # Now PATCH with invalid schedule_data
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(return_value={"schedule_data": "not json"})
+
+        resp = await _handle_update_job(mock_request)
+
+        assert resp.status == 400
+        body = json.loads(resp.body.decode())
+        assert "not valid JSON" in body["error"]
 
 
 # ── POST /api/services/{name} ─────────────────────────────────────
@@ -1465,31 +1630,322 @@ class TestJobOwnership:
         assert jobs[0]["name"] == "Original"
 
 
+# ── Jobs API multi-user authorization ─────────────────────────────
+
+
+class TestGetJobsAuth:
+    """Authorization tests for GET /api/jobs."""
+
+    @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """GET /api/jobs without chat_id falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # No query param set; should fall back to app["chat_id"] = 123
+        await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+
+        resp = await _handle_get_jobs(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert len(body) == 1
+        assert body[0]["name"] == "Admin Job"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """GET /api/jobs?chat_id=999 returns 403 for unauthorized users."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "999"}
+
+        resp = await _handle_get_jobs(mock_request)
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_authorized_chat_id_returns_only_their_jobs(self, db, mock_request):
+        """GET /api/jobs?chat_id=456 returns only user 456's jobs."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+
+        await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="admin",
+            schedule_type="daily",
+            schedule_data='{"times": ["09:00"]}',
+        )
+        await sessions.create_job(
+            chat_id=456,
+            name="User Job",
+            job_type="reminder",
+            prompt="user",
+            schedule_type="daily",
+            schedule_data='{"times": ["10:00"]}',
+        )
+
+        resp = await _handle_get_jobs(mock_request)
+        body = json.loads(resp.body.decode())
+        assert len(body) == 1
+        assert body[0]["name"] == "User Job"
+
+
+class TestGetJobAuth:
+    """Authorization and ownership tests for GET /api/jobs/{id}."""
+
+    @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """GET /api/jobs/{id} without chat_id falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # No query param set; should fall back to app["chat_id"] = 123
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["name"] == "Admin Job"
+
+    @pytest.mark.asyncio
+    async def test_wrong_owner_returns_404(self, db, mock_request):
+        """GET /api/jobs/{id} returns 404 when job belongs to another user."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # Caller is user 456, job belongs to user 123
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_owner_can_view_own_job(self, db, mock_request):
+        """GET /api/jobs/{id}?chat_id=456 returns the job when owned by 456."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=456,
+            name="User Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 200
+        body = json.loads(resp.body.decode())
+        assert body["name"] == "User Job"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """GET /api/jobs/{id}?chat_id=999 returns 403 for unauthorized user."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "999"}
+        mock_request.match_info = {"id": "1"}
+
+        resp = await _handle_get_job(mock_request)
+        assert resp.status == 403
+
+
+class TestDeleteJobAuth:
+    """Authorization tests for DELETE /api/jobs/{id}."""
+
+    @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """DELETE without chat_id falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        # No query param set; should fall back to app["chat_id"] = 123
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 200
+        assert await sessions.get_job_by_id(job_id) is None
+
+    @pytest.mark.asyncio
+    async def test_user_can_delete_own_job(self, db, mock_request):
+        """DELETE /api/jobs/{id}?chat_id=456 deletes user 456's job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=456,
+            name="User Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 200
+        assert await sessions.get_job_by_id(job_id) is None
+
+    @pytest.mark.asyncio
+    async def test_cannot_delete_other_users_job(self, db, mock_request):
+        """DELETE /api/jobs/{id}?chat_id=456 returns 404 for admin's job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "456"}
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 404
+        # Job should still exist
+        assert await sessions.get_job_by_id(job_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """DELETE /api/jobs/{id}?chat_id=999 returns 403."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.query = {"chat_id": "999"}
+        mock_request.match_info = {"id": "1"}
+
+        resp = await _handle_delete_job(mock_request)
+        assert resp.status == 403
+
+
+class TestUpdateJobAuth:
+    """Authorization tests for PATCH /api/jobs/{id}."""
+
+    @pytest.mark.asyncio
+    async def test_omitted_chat_id_defaults_to_admin(self, db, mock_request):
+        """PATCH without chat_id in body falls back to admin, preserving backward compat."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="Original",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+        # No chat_id in body; falls back to app["chat_id"] = 123
+        mock_request.json = AsyncMock(return_value={"name": "Updated"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 200
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "Updated"
+
+    @pytest.mark.asyncio
+    async def test_user_can_update_own_job(self, db, mock_request):
+        """PATCH with chat_id in body updates the user's own job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        job_id = await sessions.create_job(
+            chat_id=456,
+            name="Original",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(return_value={"chat_id": 456, "name": "Updated"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 200
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "Updated"
+
+    @pytest.mark.asyncio
+    async def test_cannot_update_other_users_job(self, db, mock_request):
+        """PATCH with chat_id=456 returns 404 for admin's job."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        job_id = await sessions.create_job(
+            chat_id=123,
+            name="Admin Job",
+            job_type="reminder",
+            prompt="test",
+            schedule_type="once",
+            schedule_data='{"run_at": "2026-06-01T12:00:00+00:00"}',
+        )
+        mock_request.match_info = {"id": str(job_id)}
+        mock_request.json = AsyncMock(return_value={"chat_id": 456, "name": "Hacked"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 404
+        # Job should be unchanged
+        job = await sessions.get_job_by_id(job_id)
+        assert job is not None
+        assert job["name"] == "Admin Job"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_chat_id_returns_403(self, db, mock_request):
+        """PATCH with unauthorized chat_id returns 403."""
+        mock_request.headers = {"X-Webhook-Secret": "test-secret"}
+        mock_request.match_info = {"id": "1"}
+        mock_request.json = AsyncMock(return_value={"chat_id": 999, "name": "Nope"})
+
+        resp = await _handle_update_job(mock_request)
+        assert resp.status == 403
+
+
 # ── Filename sanitization ──────────────────────────────────────────
 
 
 class TestFilenameSanitization:
-    def test_path_traversal(self, tmp_path):
+    def test_path_traversal(self, tmp_path, monkeypatch):
         """../../etc/passwd becomes 'passwd' inside the files directory."""
-        from kai.bot import _save_to_workspace
+        from kai.bot import _save_upload
 
-        saved = _save_to_workspace(b"test", "../../etc/passwd", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"test", "../../etc/passwd")
         assert saved.parent == tmp_path / "files"
         assert "passwd" in saved.name
         assert ".." not in str(saved)
 
-    def test_empty_filename(self, tmp_path):
+    def test_empty_filename(self, tmp_path, monkeypatch):
         """Empty filename produces unnamed_file."""
-        from kai.bot import _save_to_workspace
+        from kai.bot import _save_upload
 
-        saved = _save_to_workspace(b"test", "", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"test", "")
         assert "unnamed_file" in saved.name
 
-    def test_slash_only(self, tmp_path):
+    def test_slash_only(self, tmp_path, monkeypatch):
         """Slash-only filename produces unnamed_file."""
-        from kai.bot import _save_to_workspace
+        from kai.bot import _save_upload
 
-        saved = _save_to_workspace(b"test", "/", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        saved = _save_upload(b"test", "/")
         assert "unnamed_file" in saved.name
 
 

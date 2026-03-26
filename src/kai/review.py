@@ -27,11 +27,14 @@ import asyncio
 import glob as glob_mod
 import json
 import logging
-import secrets
+import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
+
+from kai.prompt_utils import make_boundary
 
 log = logging.getLogger(__name__)
 
@@ -177,8 +180,10 @@ def resolve_spec_from_branch(branch: str, repo_path: str, spec_dir: str = "specs
     if not specs_dir.is_dir():
         return None
 
-    # Glob for spec files containing the branch name fragment
-    pattern = str(specs_dir / f"*{name}*.md")
+    # Escape glob metacharacters (*, ?, [) in the branch name so
+    # attacker-controlled branch names can't match unintended files.
+    safe_name = glob_mod.escape(name)
+    pattern = str(specs_dir / f"*{safe_name}*.md")
     matches = sorted(glob_mod.glob(pattern))
     return matches[0] if matches else None
 
@@ -453,13 +458,9 @@ def build_review_prompt(
     # Generate unique random boundary tokens per block. Each block gets
     # its own token so even if an attacker guesses the format, they
     # cannot forge another block's delimiter.
-    def _boundary(label: str) -> tuple[str, str]:
-        token = secrets.token_hex(4)
-        return (f"--- BEGIN {label} {token} ---", f"--- END {label} {token} ---")
-
-    meta_begin, meta_end = _boundary("PR_METADATA")
-    desc_begin, desc_end = _boundary("PR_DESCRIPTION")
-    diff_begin, diff_end = _boundary("DIFF")
+    meta_begin, meta_end = make_boundary("PR_METADATA")
+    desc_begin, desc_end = make_boundary("PR_DESCRIPTION")
+    diff_begin, diff_end = make_boundary("DIFF")
 
     # Truncate oversized diffs with a note so Claude knows the review
     # is partial. Better to review what we can than to fail entirely.
@@ -490,7 +491,7 @@ def build_review_prompt(
 
     # Optional: spec compliance context (from linked GitHub issues)
     if spec:
-        spec_begin, spec_end = _boundary("SPEC")
+        spec_begin, spec_end = make_boundary("SPEC")
         parts.extend(
             [
                 spec_begin,
@@ -505,7 +506,7 @@ def build_review_prompt(
 
     # Optional: project conventions from CLAUDE.md
     if conventions:
-        conv_begin, conv_end = _boundary("CONVENTIONS")
+        conv_begin, conv_end = make_boundary("CONVENTIONS")
         parts.extend(
             [
                 conv_begin,
@@ -521,7 +522,7 @@ def build_review_prompt(
     # the agent from re-flagging issues that were already raised and
     # dismissed in prior review rounds on this same PR.
     if prior_comments:
-        prior_begin, prior_end = _boundary("PRIOR_REVIEW_THREAD")
+        prior_begin, prior_end = make_boundary("PRIOR_REVIEW_THREAD")
         parts.extend(
             [
                 prior_begin,
@@ -644,11 +645,15 @@ async def run_review(
     if claude_user:
         cmd = ["sudo", "-u", claude_user, "--"] + cmd
 
+    # When claude_user is set, start in a new process group so the
+    # entire tree (sudo + claude) can be killed via os.killpg().
+    # Without this, killing sudo orphans the claude Node.js process.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=bool(claude_user),
     )
 
     try:
@@ -657,8 +662,17 @@ async def run_review(
             timeout=_REVIEW_TIMEOUT,
         )
     except TimeoutError:
-        # Kill the subprocess tree if it exceeds the timeout
-        proc.kill()
+        # Kill the subprocess tree if it exceeds the timeout.
+        # When claude_user is set, start_new_session=True puts the
+        # process in a new group (PGID == PID). Kill the group so
+        # both sudo and its claude child die, preventing orphans.
+        if claude_user:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # Already dead
+        else:
+            proc.kill()
         await proc.wait()
         raise RuntimeError(f"Review subprocess timed out after {_REVIEW_TIMEOUT}s") from None
 

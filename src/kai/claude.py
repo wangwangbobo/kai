@@ -35,7 +35,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from kai.config import WorkspaceConfig, parse_env_file
+from kai.config import DATA_DIR, WorkspaceConfig, parse_env_file
 from kai.history import get_recent_history
 
 log = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ class PersistentClaude:
         self,
         *,
         model: str = "sonnet",
-        workspace: Path = Path("workspace"),
+        workspace: Path = Path("home"),
         home_workspace: Path | None = None,
         webhook_port: int = 8080,
         webhook_secret: str = "",
@@ -395,17 +395,19 @@ class PersistentClaude:
                     if identity:
                         parts.append(f"[Your core identity and instructions:]\n{identity}")
 
-            # Always inject Kai's personal memory from home workspace
-            memory_path = self.home_workspace / ".claude" / "MEMORY.md"
+            # Always inject Kai's personal memory from DATA_DIR. This file
+            # lives outside the install tree (/var/lib/kai/memory/ in production)
+            # so it survives make install. Available regardless of which
+            # workspace the inner Claude is operating in.
+            memory_path = DATA_DIR / "memory" / "MEMORY.md"
             if memory_path.exists():
                 memory = memory_path.read_text().strip()
                 if memory:
-                    parts.append(f"[Your persistent memory from home workspace:]\n{memory}")
-
-            # NOTE: Foreign workspace memory (.claude/MEMORY.md) is NOT injected
-            # here. Claude Code reads it natively from its cwd (built-in auto-memory).
-            # Bot-side reads are redundant and can cause PermissionError on Linux
-            # when the workspace is owned by a different user (CLAUDE_USER).
+                    parts.append(f"[Your persistent memory (file: {memory_path}):]\n{memory}")
+                else:
+                    parts.append(f"[Your persistent memory (file: {memory_path}):]\n(currently empty)")
+            else:
+                parts.append(f"[Your persistent memory (file: {memory_path}):]\n(not yet created)")
 
             # Per-workspace system prompt from workspaces.yaml. Injected
             # between the identity/memory block and conversation history,
@@ -414,12 +416,21 @@ class PersistentClaude:
             if ws_prompt:
                 parts.append(f"## Workspace Instructions\n\n{ws_prompt}")
 
+            # Always inject the history directory path so the inner Claude
+            # can grep past conversations regardless of whether there are
+            # recent messages to show.
+            history_dir = str(DATA_DIR / "history")
+
             # Inject recent conversation history for continuity.
             # Filter by chat_id so each user's session only sees their
             # own messages (Phase 2 per-user data isolation).
             recent = get_recent_history(chat_id=chat_id)
             if recent:
-                parts.append(f"[Recent conversations (search .claude/history/ for full logs):]\n{recent}")
+                parts.append(f"[Recent conversations (search {history_dir}/ for full logs):]\n{recent}")
+            else:
+                parts.append(
+                    f"[Chat history is stored in {history_dir}/ as daily JSONL files. Search with grep or jq when asked about past conversations.]"
+                )
 
             # Inject scheduling API info (always, so cron works from any workspace).
             # The secret is passed via $KAI_WEBHOOK_SECRET env var (not embedded
@@ -453,7 +464,7 @@ class PersistentClaude:
                     f'Required: "text" (the message content). '
                     f"Long messages are automatically split at Telegram's 4096-char limit.]"
                 )
-                files_path = f"{self.workspace}/files/{chat_id}/" if chat_id else f"{self.workspace}/files/"
+                files_path = f"{DATA_DIR}/files/{chat_id}/" if chat_id else f"{DATA_DIR}/files/"
                 parts.append(
                     f"[File API: To send a file to the user, POST JSON to "
                     f"http://localhost:{self.webhook_port}/api/send-file "
@@ -723,9 +734,14 @@ class PersistentClaude:
             workspace_config: Per-workspace config for the target, or
                 None to use global defaults.
         """
-        # No lock needed: _kill() terminates the process, and the next send()
-        # call will start fresh in the new workspace via _ensure_started().
-        # Any in-flight send() will see EOF on stdout and clean up.
+        # Kill first, then mutate. An in-flight _send_locked() reads
+        # self.workspace, self.timeout_seconds, and self.workspace_config
+        # at various await points during streaming. If we mutate before
+        # killing, the stream sees new config values while still running
+        # the old workspace's process. Killing first ensures the stream
+        # hits EOF and exits before any state changes.
+        await self._kill()
+
         self.workspace = new_workspace
         self.workspace_config = workspace_config
 
@@ -746,8 +762,6 @@ class PersistentClaude:
             if workspace_config.timeout is not None:
                 self.timeout_seconds = workspace_config.timeout
 
-        await self._kill()
-
     async def restart(self) -> None:
         """
         Kill the current process so the next send() starts fresh.
@@ -765,6 +779,10 @@ class PersistentClaude:
         the initial signal (e.g., claude reparented to init after sudo
         died). The timeout prevents hanging on zombie processes.
         Idempotent - safe to call even if the process has already exited.
+
+        Note: _stderr_task cancellation is inside the `if self._proc` guard
+        because _stderr_task is only created alongside _proc in _ensure_started().
+        If _proc is None, there is no stderr task to cancel.
         """
         if self._proc:
             # Save pgid before clearing - the EOF handler in _send_locked()
@@ -779,6 +797,17 @@ class PersistentClaude:
                 await asyncio.wait_for(self._proc.wait(), timeout=5)
             except TimeoutError:
                 pass
+
+            # Cancel the stderr drain BEFORE clearing self._proc.
+            # _drain_stderr's while-loop checks self._proc on each iteration;
+            # if we clear proc first, the drain task could observe None in a
+            # state that was never intended to be visible to it. Cancelling
+            # the task first ensures it stops reading before its dependencies
+            # are destroyed.
+            if self._stderr_task:
+                self._stderr_task.cancel()
+                self._stderr_task = None
+
             self._proc = None
             self._pgid = None
             self._session_id = None
@@ -794,9 +823,6 @@ class PersistentClaude:
                     os.killpg(saved_pgid, signal.SIGKILL)
                 except OSError:
                     pass
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            self._stderr_task = None
 
     async def shutdown(self) -> None:
         """
@@ -827,13 +853,16 @@ class PersistentClaude:
         else:
             saved_pgid = None
 
+        # Cancel stderr drain before clearing proc (same invariant as _kill:
+        # the drain task checks self._proc, so cancel it first).
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+
         # Clean up state regardless of how (or whether) the process exited
         self._proc = None
         self._pgid = None
         self._session_started_at = None
-        if self._stderr_task:
-            self._stderr_task.cancel()
-            self._stderr_task = None
 
         # Final cleanup: signal the saved process group one more time
         # to catch any orphaned children that survived the initial signals.

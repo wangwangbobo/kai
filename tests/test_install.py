@@ -915,7 +915,7 @@ class TestApplyMigrate:
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (data_path / "kai.db").exists()
         assert (data_path / "kai.db").read_text() == "fake-db-content"
@@ -941,7 +941,7 @@ class TestApplyMigrate:
         monkeypatch.setattr("kai.install.subprocess.run", mock_run)
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Find the sqlite3 call
         sqlite_calls = [c for c in calls if "sqlite3" in c[0]]
@@ -959,7 +959,7 @@ class TestApplyMigrate:
         (data_path / "logs").mkdir()
         (data_path / "kai.db").write_text("existing-content")
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Destination should be unchanged
         assert (data_path / "kai.db").read_text() == "existing-content"
@@ -982,7 +982,7 @@ class TestApplyMigrate:
         # Mock os.chown for ownership setting
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         assert (logs_dst / "kai.log").read_text() == "log1"
         assert (logs_dst / "kai.log.1").read_text() == "log2"
@@ -1006,7 +1006,7 @@ class TestApplyMigrate:
         )
         monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=False)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
 
         # Source files must still exist
         assert (tmp_path / "src" / "kai.db").exists()
@@ -1025,13 +1025,169 @@ class TestApplyMigrate:
         data_path.mkdir()
         (data_path / "logs").mkdir()
 
-        _apply_migrate(data_path, svc_uid=501, svc_gid=20, dry_run=True)
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=True)
 
         output = capsys.readouterr().out
         assert "[DRY RUN]" in output
         # Nothing should have been copied
         assert not (data_path / "kai.db").exists()
         assert not (data_path / "logs" / "kai.log").exists()
+
+    def test_copies_history(self, tmp_path, monkeypatch):
+        """Copies JSONL history files from home/.claude/history/ to data_path/history/."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        history_src = tmp_path / "src" / "home" / ".claude" / "history"
+        history_src.mkdir(parents=True)
+        (history_src / "2026-03-20.jsonl").write_text('{"ts":"2026-03-20","text":"hello"}')
+        (history_src / "2026-03-21.jsonl").write_text('{"ts":"2026-03-21","text":"world"}')
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        history_dst = data_path / "history"
+        history_dst.mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (history_dst / "2026-03-20.jsonl").exists()
+        assert (history_dst / "2026-03-21.jsonl").exists()
+        # Source files preserved
+        assert (history_src / "2026-03-20.jsonl").exists()
+
+    def test_history_skips_existing(self, tmp_path, monkeypatch, capsys):
+        """Does not overwrite history files that already exist at the destination."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        history_src = tmp_path / "src" / "home" / ".claude" / "history"
+        history_src.mkdir(parents=True)
+        (history_src / "2026-03-20.jsonl").write_text("source content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        history_dst = data_path / "history"
+        history_dst.mkdir()
+        (history_dst / "2026-03-20.jsonl").write_text("existing content")
+
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
+
+        # Destination unchanged
+        assert (history_dst / "2026-03-20.jsonl").read_text() == "existing content"
+        output = capsys.readouterr().out
+        assert "already migrated" in output
+
+    def test_copies_memory(self, tmp_path, monkeypatch, capsys):
+        """Copies MEMORY.md from home/.claude/ to data_path/memory/."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("User prefers dry humor.")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "memory").mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
+
+        memory_dst = data_path / "memory" / "MEMORY.md"
+        assert memory_dst.exists()
+        assert memory_dst.read_text() == "User prefers dry humor."
+        # Source preserved
+        assert (claude_dir / "MEMORY.md").exists()
+        assert "Migrated MEMORY.md" in capsys.readouterr().out
+
+    def test_memory_skips_existing(self, tmp_path, monkeypatch):
+        """Does not overwrite MEMORY.md that already exists at the destination."""
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        claude_dir = tmp_path / "src" / "home" / ".claude"
+        claude_dir.mkdir(parents=True)
+        (claude_dir / "MEMORY.md").write_text("old content")
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        memory_dir = data_path / "memory"
+        memory_dir.mkdir()
+        (memory_dir / "MEMORY.md").write_text("existing personalized content")
+
+        _apply_migrate(data_path, tmp_path / "install", svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (memory_dir / "MEMORY.md").read_text() == "existing personalized content"
+
+    def test_copies_uploaded_files(self, tmp_path, monkeypatch):
+        """Copies uploaded files from home/files/ to data_path/files/."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files" / "123"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"image data")
+        (files_src / "doc.pdf").write_bytes(b"pdf data")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "files").mkdir()
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (data_path / "files" / "123" / "photo.jpg").read_bytes() == b"image data"
+        assert (data_path / "files" / "123" / "doc.pdf").read_bytes() == b"pdf data"
+        # Source files preserved
+        assert (files_src / "photo.jpg").exists()
+
+    def test_uploaded_files_skip_existing(self, tmp_path, monkeypatch):
+        """Does not overwrite uploaded files that already exist at the destination."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"source")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        files_dst = data_path / "files"
+        files_dst.mkdir()
+        (files_dst / "photo.jpg").write_bytes(b"existing")
+
+        monkeypatch.setattr("kai.install.os.chown", lambda *a: None)
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=False)
+
+        assert (files_dst / "photo.jpg").read_bytes() == b"existing"
+
+    def test_uploaded_files_dry_run(self, tmp_path, monkeypatch, capsys):
+        """Dry run prints file migration actions without copying."""
+        install_path = tmp_path / "install"
+        files_src = install_path / "home" / "files"
+        files_src.mkdir(parents=True)
+        (files_src / "photo.jpg").write_bytes(b"image data")
+
+        monkeypatch.setattr("kai.install.PROJECT_ROOT", tmp_path / "src")
+        (tmp_path / "src").mkdir()
+
+        data_path = tmp_path / "data"
+        data_path.mkdir()
+        (data_path / "logs").mkdir()
+        (data_path / "files").mkdir()
+
+        _apply_migrate(data_path, install_path, svc_uid=501, svc_gid=20, dry_run=True)
+
+        output = capsys.readouterr().out
+        assert "[DRY RUN] Would copy file:" in output
+        assert "Would migrate 1 uploaded file(s)" in output
+        # Nothing should have been copied
+        assert not (data_path / "files" / "photo.jpg").exists()
 
 
 # ── Service lifecycle ────────────────────────────────────────────────
@@ -1234,17 +1390,48 @@ class TestCopyTree:
         assert (dst / "file.py").exists()
         assert not (dst / "__pycache__").exists()
 
-    def test_overwrites_existing(self, tmp_path):
-        """Existing destination is removed before copy."""
+    def test_preserves_destination_only_files(self, tmp_path: Path) -> None:
+        """Files at destination that don't exist in source survive the copy."""
         src = tmp_path / "src"
         src.mkdir()
         (src / "new.py").write_text("new")
+
         dst = tmp_path / "dst"
         dst.mkdir()
-        (dst / "old.py").write_text("old")
+        (dst / "runtime_data.txt").write_text("must survive")
+
         _copy_tree(src, dst)
-        assert (dst / "new.py").exists()
-        assert not (dst / "old.py").exists()
+
+        assert (dst / "new.py").read_text() == "new"
+        assert (dst / "runtime_data.txt").read_text() == "must survive"
+
+    def test_overwrites_matching_files(self, tmp_path: Path) -> None:
+        """Source files overwrite same-named destination files."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "config.py").write_text("updated")
+
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        (dst / "config.py").write_text("old version")
+
+        _copy_tree(src, dst)
+
+        assert (dst / "config.py").read_text() == "updated"
+
+    def test_excludes_nested_directories(self, tmp_path: Path) -> None:
+        """Excluded directories are not descended into or copied."""
+        src = tmp_path / "src"
+        (src / "keep").mkdir(parents=True)
+        (src / "keep" / "file.txt").write_text("kept")
+        (src / "skip" / "sub").mkdir(parents=True)
+        (src / "skip" / "sub" / "deep.txt").write_text("should not appear")
+
+        dst = tmp_path / "dst"
+        _copy_tree(src, dst, excludes={"skip"})
+
+        assert (dst / "keep" / "file.txt").read_text() == "kept"
+        assert not (dst / "skip").exists()
 
 
 # ── _user_home ───────────────────────────────────────────────────────
@@ -1300,8 +1487,8 @@ class TestGenerateLauncherScript:
 class TestApplySource:
     def test_dry_run(self, tmp_path, capsys):
         """Dry run: prints messages, doesn't copy."""
-        # Create workspace/.claude/ so the dry-run message appears
-        ws_claude = tmp_path / "workspace" / ".claude"
+        # Create home/.claude/ so the dry-run message appears
+        ws_claude = tmp_path / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
         with patch("kai.install.PROJECT_ROOT", tmp_path):
@@ -1309,25 +1496,25 @@ class TestApplySource:
         output = capsys.readouterr().out
         assert "DRY RUN" in output
         assert "Would copy" in output
-        # Dry run should NOT create workspace/.claude/ at the destination
-        assert not (tmp_path / "install" / "workspace" / ".claude").exists()
+        # Dry run should NOT create home/.claude/ at the destination
+        assert not (tmp_path / "install" / "home" / ".claude").exists()
 
-    def test_dry_run_no_workspace_claude(self, tmp_path, capsys):
-        """Dry run without workspace/.claude/: no workspace copy message."""
+    def test_dry_run_no_home_claude(self, tmp_path, capsys):
+        """Dry run without home/.claude/: no home config copy message."""
         with patch("kai.install.PROJECT_ROOT", tmp_path):
             _apply_source(tmp_path / "install", svc_uid=1000, svc_gid=1000, dry_run=True)
         output = capsys.readouterr().out
         assert "DRY RUN" in output
-        assert "workspace" not in output.lower() or "workspace config" not in output
+        assert "home config" not in output
 
     def test_actual(self, tmp_path):
-        """Actual: copies source, pyproject.toml, and workspace/.claude/."""
+        """Actual: copies source, pyproject.toml, and home/.claude/."""
         # Set up source structure
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
         (src / "pyproject.toml").write_text("[project]")
-        ws_claude = src / "workspace" / ".claude"
+        ws_claude = src / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
         install = tmp_path / "install"
@@ -1341,21 +1528,21 @@ class TestApplySource:
             patch("os.chown") as mock_chown,
         ):
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-        # Should call _copy_tree twice: once for src/, once for workspace/.claude/
+        # Should call _copy_tree twice: once for src/, once for home/.claude/
         assert mock_copy.call_count == 2
-        # Should call _set_ownership twice: once for src/, once for workspace/.claude/
+        # Should call _set_ownership twice: once for src/, once for home/.claude/
         assert mock_own.call_count == 2
         mock_cp.assert_called_once()
         # os.chown called twice: once for pyproject.toml (root), once for
         # the .claude/ directory itself (service user)
-        ws_claude_dst = install / "workspace" / ".claude"
+        ws_claude_dst = install / "home" / ".claude"
         chown_calls = mock_chown.call_args_list
         assert any(c.args == (ws_claude_dst, 1000, 1000) for c in chown_calls), (
             f"Expected os.chown({ws_claude_dst}, 1000, 1000) in {chown_calls}"
         )
 
-    def test_actual_no_workspace_claude(self, tmp_path):
-        """Actual without workspace/.claude/: copies source only, no error."""
+    def test_actual_no_home_claude(self, tmp_path):
+        """Actual without home/.claude/: copies source only, no error."""
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
@@ -1371,20 +1558,20 @@ class TestApplySource:
             patch("os.chown"),
         ):
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
-        # Only one _copy_tree call (src/), no workspace/.claude/ copy
+        # Only one _copy_tree call (src/), no home/.claude/ copy
         mock_copy.assert_called_once()
         mock_own.assert_called_once()
         mock_cp.assert_called_once()
 
-    def test_workspace_claude_excludes(self, tmp_path):
-        """Workspace copy excludes history/, MEMORY.md, skills/, __pycache__."""
-        from kai.install import _WORKSPACE_CLAUDE_EXCLUDES
+    def test_home_claude_excludes(self, tmp_path):
+        """Home config copy excludes history/, MEMORY.md, skills/, __pycache__."""
+        from kai.install import _HOME_CLAUDE_EXCLUDES
 
         src = tmp_path / "source"
         (src / "src").mkdir(parents=True)
         (src / "src" / "module.py").write_text("code")
         (src / "pyproject.toml").write_text("[project]")
-        ws_claude = src / "workspace" / ".claude"
+        ws_claude = src / "home" / ".claude"
         ws_claude.mkdir(parents=True)
         (ws_claude / "CLAUDE.md").write_text("identity")
         install = tmp_path / "install"
@@ -1399,9 +1586,9 @@ class TestApplySource:
         ):
             _apply_source(install, svc_uid=1000, svc_gid=1000, dry_run=False)
 
-        # Second _copy_tree call is for workspace/.claude/
+        # Second _copy_tree call is for home/.claude/
         ws_call = mock_copy.call_args_list[1]
-        assert ws_call[0][2] == _WORKSPACE_CLAUDE_EXCLUDES
+        assert ws_call[0][2] == _HOME_CLAUDE_EXCLUDES
 
 
 # ── _apply_models ────────────────────────────────────────────────────

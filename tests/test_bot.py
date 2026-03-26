@@ -19,7 +19,6 @@ from telegram.error import BadRequest
 from kai.bot import (
     _QUEUED_MESSAGE_MARKER,
     _acquire_lock_or_kill,
-    _chunk_text,
     _clear_responding,
     _do_switch_workspace,
     _edit_message_safe,
@@ -31,7 +30,7 @@ from kai.bot import (
     _reply_safe,
     _require_auth,
     _resolve_workspace_path,
-    _save_to_workspace,
+    _save_upload,
     _set_responding,
     _short_workspace_name,
     _switch_workspace,
@@ -104,36 +103,6 @@ class TestShortWorkspaceName:
         assert _short_workspace_name("/some/path/project", None) == "project"
 
 
-# ── _chunk_text ──────────────────────────────────────────────────────
-
-
-class TestChunkText:
-    def test_short_text_single_chunk(self):
-        assert _chunk_text("hello", 100) == ["hello"]
-
-    def test_splits_at_double_newline(self):
-        text = "a" * 50 + "\n\n" + "b" * 50
-        chunks = _chunk_text(text, 60)
-        assert len(chunks) == 2
-        assert chunks[0] == "a" * 50
-        assert chunks[1] == "b" * 50
-
-    def test_splits_at_single_newline_if_no_double(self):
-        text = "a" * 50 + "\n" + "b" * 50
-        chunks = _chunk_text(text, 60)
-        assert len(chunks) == 2
-        assert chunks[0] == "a" * 50
-        assert chunks[1] == "b" * 50
-
-    def test_splits_at_max_len_if_no_newlines(self):
-        text = "a" * 100
-        chunks = _chunk_text(text, 50)
-        assert chunks == ["a" * 50, "a" * 50]
-
-    def test_empty_string(self):
-        assert _chunk_text("") == []
-
-
 # ── _truncate_for_telegram ───────────────────────────────────────────
 
 
@@ -152,44 +121,50 @@ class TestTruncateForTelegram:
         assert _truncate_for_telegram(text, 50) == text
 
 
-# ── _save_to_workspace ──────────────────────────────────────────────
+# ── _save_upload ────────────────────────────────────────────────────
 
 
-class TestSaveToWorkspace:
-    def test_creates_files_directory(self, tmp_path):
+class TestSaveUpload:
+    def test_creates_files_directory(self, tmp_path, monkeypatch):
         """Automatically creates the files/ subdirectory if missing."""
-        _save_to_workspace(b"hello", "test.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        _save_upload(b"hello", "test.txt")
         assert (tmp_path / "files").is_dir()
 
-    def test_saves_content_correctly(self, tmp_path):
+    def test_saves_content_correctly(self, tmp_path, monkeypatch):
         """Written bytes match the input exactly."""
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
         data = b"binary content here"
-        result = _save_to_workspace(data, "doc.pdf", tmp_path)
+        result = _save_upload(data, "doc.pdf")
         assert result.read_bytes() == data
 
-    def test_filename_contains_original_name(self, tmp_path):
+    def test_filename_contains_original_name(self, tmp_path, monkeypatch):
         """Saved filename preserves the original name after the timestamp."""
-        result = _save_to_workspace(b"x", "report.pdf", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "report.pdf")
         assert "report.pdf" in result.name
 
-    def test_timestamp_prefix_format(self, tmp_path):
+    def test_timestamp_prefix_format(self, tmp_path, monkeypatch):
         """Filename starts with YYYYMMDD_HHMMSS_ffffff timestamp."""
-        result = _save_to_workspace(b"x", "file.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "file.txt")
         # Format: YYYYMMDD_HHMMSS_ffffff_file.txt
         parts = result.name.split("_", 3)
         assert len(parts[0]) == 8  # date
         assert len(parts[1]) == 6  # time
         assert len(parts[2]) == 6  # microseconds
 
-    def test_sanitizes_slashes_and_spaces(self, tmp_path):
+    def test_sanitizes_slashes_and_spaces(self, tmp_path, monkeypatch):
         """Slashes and spaces in filenames are replaced with underscores."""
-        result = _save_to_workspace(b"x", "my file/name.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "my file/name.txt")
         assert "/" not in result.name
         assert " " not in result.name
 
-    def test_returns_absolute_path(self, tmp_path):
+    def test_returns_absolute_path(self, tmp_path, monkeypatch):
         """Returned path is absolute and points to an existing file."""
-        result = _save_to_workspace(b"x", "test.txt", tmp_path)
+        monkeypatch.setattr("kai.bot.DATA_DIR", tmp_path)
+        result = _save_upload(b"x", "test.txt")
         assert result.is_absolute()
         assert result.is_file()
 
@@ -449,7 +424,7 @@ def _make_mock_claude(model="sonnet", workspace=None, is_alive=True):
     pool.get_session_id = MagicMock(return_value=None)
     pool.restart = AsyncMock()
     pool.change_workspace = AsyncMock()
-    pool.force_kill = MagicMock()
+    pool.force_kill = AsyncMock()
     pool.send = MagicMock()  # configured per test
     return pool
 

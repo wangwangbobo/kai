@@ -57,6 +57,7 @@ from kai.config import DATA_DIR, Config, WorkspaceConfig
 from kai.history import log_message
 from kai.locks import get_lock, get_stop_event
 from kai.pool import SubprocessPool
+from kai.telegram_utils import chunk_text
 from kai.transcribe import TranscriptionError, transcribe_voice
 from kai.tts import DEFAULT_VOICE, VOICES, TTSError, synthesize_speech
 
@@ -185,7 +186,7 @@ async def _acquire_lock_or_kill(
             chat_id,
             _LOCK_ACQUIRE_TIMEOUT,
         )
-        pool.force_kill(chat_id)
+        await pool.force_kill(chat_id)
         # update.message can be None for edited messages or callback
         # queries, so guard rather than assert.
         if update.message is not None:
@@ -303,41 +304,10 @@ async def _edit_message_safe(msg: Message, text: str) -> None:
         log.debug("Failed to edit message", exc_info=True)
 
 
-def _chunk_text(text: str, max_len: int = 4096) -> list[str]:
-    """
-    Split text into Telegram-safe chunks at natural break points.
-
-    Prefers splitting at double newlines (paragraph breaks), then single
-    newlines, and only falls back to hard-cutting at max_len if no break
-    point is found. This keeps code blocks and paragraphs intact.
-
-    Args:
-        text: The text to split.
-        max_len: Maximum length per chunk (Telegram's limit is 4096).
-
-    Returns:
-        A list of text chunks, each within max_len.
-    """
-    chunks = []
-    while text:
-        if len(text) <= max_len:
-            chunks.append(text)
-            break
-        # Try paragraph break, then line break, then hard cut
-        split_at = text.rfind("\n\n", 0, max_len)
-        if split_at == -1:
-            split_at = text.rfind("\n", 0, max_len)
-        if split_at == -1:
-            split_at = max_len
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    return chunks
-
-
 async def _send_response(update: Update, text: str) -> None:
     """Send a potentially long response as multiple chunked messages."""
     assert update.message is not None
-    for chunk in _chunk_text(text):
+    for chunk in chunk_text(text):
         await _reply_safe(update.message, chunk)
 
 
@@ -706,7 +676,7 @@ async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     pool = _get_pool(context)
     stop_event = get_stop_event(chat_id)
     stop_event.set()
-    pool.force_kill(chat_id)
+    await pool.force_kill(chat_id)
     await update.message.reply_text("Stopping...")
 
 
@@ -1228,9 +1198,9 @@ async def handle_unknown_command(update: Update, context: ContextTypes.DEFAULT_T
 # ── Media message handlers ──────────────────────────────────────────
 
 
-def _save_to_workspace(data: bytes, filename: str, workspace: Path, user_id: int | None = None) -> Path:
+def _save_upload(data: bytes, filename: str, user_id: int | None = None) -> Path:
     """
-    Save file bytes to the workspace/files/ directory with a timestamped name.
+    Save file bytes to DATA_DIR/files/ with a timestamped name.
 
     Creates the files/ directory if it doesn't exist. Filenames are prefixed
     with a timestamp to avoid collisions and sanitized to remove slashes and
@@ -1238,23 +1208,22 @@ def _save_to_workspace(data: bytes, filename: str, workspace: Path, user_id: int
     reference it in subsequent commands.
 
     When user_id is provided, files are saved to a per-user subdirectory
-    (workspace/files/{user_id}/) to prevent cross-user file access.
-    When None, uses the shared workspace/files/ directory (backward-
+    (DATA_DIR/files/{user_id}/) to prevent cross-user file access.
+    When None, uses the shared DATA_DIR/files/ directory (backward-
     compatible for single-user deployments).
 
     Args:
         data: Raw file bytes to write.
         filename: Original filename from Telegram (sanitized before use).
-        workspace: The current workspace root directory.
         user_id: Optional Telegram user ID for per-user file isolation.
 
     Returns:
         Absolute path to the saved file.
     """
     if user_id is not None:
-        files_dir = workspace / "files" / str(user_id)
+        files_dir = DATA_DIR / "files" / str(user_id)
     else:
-        files_dir = workspace / "files"
+        files_dir = DATA_DIR / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
 
     # Timestamp prefix ensures unique names even if the same file is sent twice
@@ -1296,8 +1265,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = bytes(data)
     b64 = base64.b64encode(raw).decode()
 
-    # Save to workspace so Claude can access the file via shell tools
-    saved = _save_to_workspace(raw, f"photo_{photo.file_unique_id}.jpg", pool.get_workspace(chat_id), user_id=chat_id)
+    # Save to DATA_DIR/files/ so Claude can access the file via shell tools
+    saved = _save_upload(raw, f"photo_{photo.file_unique_id}.jpg", user_id=chat_id)
 
     caption = update.message.caption or "What's in this image?"
     caption += f"\n[File saved to: {saved}]"
@@ -1425,8 +1394,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         b64 = base64.b64encode(raw).decode()
         media_type = _IMAGE_MEDIA_TYPES[suffix]
 
-        # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, pool.get_workspace(chat_id), user_id=chat_id)
+        # Save to DATA_DIR/files/ so Claude can access the file via shell tools
+        saved = _save_upload(raw, file_name, user_id=chat_id)
         img_caption = caption or f"What's in this image ({file_name})?"
         img_caption += f"\n[File saved to: {saved}]"
 
@@ -1451,8 +1420,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await update.message.reply_text(f"Couldn't decode {file_name} as text.")
             return
 
-        # Save to workspace so Claude can access the file via shell tools
-        saved = _save_to_workspace(raw, file_name, pool.get_workspace(chat_id), user_id=chat_id)
+        # Save to DATA_DIR/files/ so Claude can access the file via shell tools
+        saved = _save_upload(raw, file_name, user_id=chat_id)
         header = f"File: {file_name}\n```\n{text_content}\n```\n[File saved to: {saved}]"
 
         log_message(
@@ -1470,7 +1439,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # can work with the file via shell tools (e.g., unzip, pdftotext, etc.)
         file = await context.bot.get_file(doc.file_id)
         data = await file.download_as_bytearray()
-        saved = _save_to_workspace(bytes(data), file_name, pool.get_workspace(chat_id), user_id=chat_id)
+        saved = _save_upload(bytes(data), file_name, user_id=chat_id)
 
         log_message(
             direction="user",
@@ -1606,7 +1575,7 @@ async def _check_totp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> boo
     Informational commands (/stats, /help, /jobs, etc.) do NOT need
     this gate since they don't invoke Claude with user content.
     """
-    if not is_totp_configured():
+    if not await asyncio.to_thread(is_totp_configured):
         return True
 
     assert context.user_data is not None
@@ -1654,7 +1623,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # which only handles the first two steps. We keep the expiry check
     # inline here because _check_totp sets totp_pending as a side effect,
     # and we need to read the pending state before that happens.
-    if is_totp_configured():
+    if await asyncio.to_thread(is_totp_configured):
         assert context.user_data is not None
         assert update.effective_chat is not None
 
@@ -1678,6 +1647,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
             code = update.message.text.strip() if update.message.text else ""
 
+            # Only treat 6-digit ASCII strings as code attempts. Other
+            # messages (e.g., normal chat that arrived concurrently with the
+            # challenge) are dropped with a brief reminder instead of being
+            # fed to verify_code(). This prevents message deletion, spurious
+            # "Invalid code" responses, and unnecessary sudo calls.
+            # Note: isascii() guard is needed because isdigit() accepts
+            # non-ASCII digit characters (superscripts, Arabic-Indic, etc.).
+            if not (code.isascii() and code.isdigit() and len(code) == 6):
+                await update.effective_chat.send_message("Authentication required. Enter your 6-digit code.")
+                return
+
             # Delete the code message so it doesn't linger in chat
             try:
                 await update.message.delete()
@@ -1685,7 +1665,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 pass
 
             # Check global lockout before calling verify_code()
-            lockout_remaining = get_lockout_remaining()
+            lockout_remaining = await asyncio.to_thread(get_lockout_remaining)
             if lockout_remaining > 0:
                 minutes = math.ceil(lockout_remaining / 60)
                 await update.effective_chat.send_message(
@@ -1696,21 +1676,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             lockout_attempts = totp_cfg.totp_lockout_attempts
             lockout_minutes = totp_cfg.totp_lockout_minutes
 
-            if verify_code(code, lockout_attempts, lockout_minutes):
+            if await asyncio.to_thread(verify_code, code, lockout_attempts, lockout_minutes):
                 del context.user_data["totp_pending"]
                 context.user_data["totp_authenticated_at"] = time.time()
                 await update.effective_chat.send_message("Authenticated.")
                 return
 
             # Verification failed
-            lockout_remaining = get_lockout_remaining()
+            lockout_remaining = await asyncio.to_thread(get_lockout_remaining)
             if lockout_remaining > 0:
                 del context.user_data["totp_pending"]
                 await update.effective_chat.send_message(
                     f"Too many failed attempts. Locked out for {lockout_minutes} minutes."
                 )
             else:
-                remaining = lockout_attempts - get_failure_count()
+                remaining = lockout_attempts - await asyncio.to_thread(get_failure_count)
                 await update.effective_chat.send_message(f"Invalid code. {remaining} attempt(s) remaining.")
             return
 
@@ -1913,7 +1893,7 @@ async def _handle_response(
                 await _edit_message_safe(live_msg, final_text)
         else:
             # Response exceeds Telegram's limit — edit first chunk, send the rest
-            chunks = _chunk_text(final_text)
+            chunks = chunk_text(final_text)
             await _edit_message_safe(live_msg, chunks[0])
             for chunk in chunks[1:]:
                 await _reply_safe(update.message, chunk)

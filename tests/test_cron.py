@@ -343,14 +343,16 @@ class TestJobCallbackReminder:
     @pytest.mark.asyncio()
     async def test_sends_prompt_to_telegram(self, mock_context):
         """Reminder jobs send the prompt text as a Telegram message."""
-        await _job_callback(mock_context)
+        with patch("kai.cron.log_message"):
+            await _job_callback(mock_context)
         mock_context.bot.send_message.assert_called_once_with(chat_id=12345, text="Test prompt")
 
     @pytest.mark.asyncio()
     async def test_strips_backslash_escapes(self, mock_context):
         """Stray backslash escapes from bash double-quoting in curl are cleaned."""
         mock_context.job.data["prompt"] = "Don\\!t forget\\. Really\\?"
-        await _job_callback(mock_context)
+        with patch("kai.cron.log_message"):
+            await _job_callback(mock_context)
         mock_context.bot.send_message.assert_called_once_with(chat_id=12345, text="Don!t forget. Really?")
 
     @pytest.mark.asyncio()
@@ -367,7 +369,10 @@ class TestJobCallbackReminder:
     async def test_forbidden_deactivates_and_removes(self, mock_context):
         """When the chat is gone (Forbidden), the job is deactivated and removed."""
         mock_context.bot.send_message.side_effect = Forbidden("bot was blocked")
-        with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
+        with (
+            patch("kai.cron.log_message"),
+            patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
+        ):
             await _job_callback(mock_context)
         mock_deactivate.assert_called_once_with(1)
         mock_context.job.schedule_removal.assert_called_once()
@@ -376,7 +381,10 @@ class TestJobCallbackReminder:
     async def test_other_exception_does_not_deactivate(self, mock_context):
         """Non-Forbidden exceptions log the error but don't deactivate the job."""
         mock_context.bot.send_message.side_effect = RuntimeError("network error")
-        with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
+        with (
+            patch("kai.cron.log_message"),
+            patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
+        ):
             await _job_callback(mock_context)
         mock_deactivate.assert_not_called()
 
@@ -384,7 +392,10 @@ class TestJobCallbackReminder:
     async def test_one_shot_deactivates_after_sending(self, mock_context):
         """One-shot reminders (schedule_type=once) auto-deactivate after delivery."""
         mock_context.job.data["schedule_type"] = "once"
-        with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
+        with (
+            patch("kai.cron.log_message"),
+            patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
+        ):
             await _job_callback(mock_context)
         mock_deactivate.assert_called_once_with(1)
         # schedule_removal is NOT called - APScheduler handles that for run_once
@@ -483,6 +494,34 @@ class TestJobCallbackClaude:
         """Non-Forbidden send exceptions log the error but keep the job active."""
         self.ctx.bot_data = {"pool": _make_claude_mock()}
         self.ctx.bot.send_message.side_effect = RuntimeError("timeout")
+        with (
+            patch("kai.cron.log_message"),
+            patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
+        ):
+            await _job_callback(self.ctx)
+        mock_deactivate.assert_not_called()
+
+    @pytest.mark.asyncio()
+    async def test_one_shot_claude_deactivates_after_sending(self):
+        """One-shot Claude jobs (schedule_type=once) deactivate after delivery."""
+        self.ctx.job.data["schedule_type"] = "once"
+        self.ctx.bot_data = {"pool": _make_claude_mock("The answer is 42")}
+        with (
+            patch("kai.cron.log_message"),
+            patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
+        ):
+            await _job_callback(self.ctx)
+        mock_deactivate.assert_called_once_with(1)
+        # APScheduler handles queue removal for run_once jobs automatically.
+        # schedule_removal() is only needed for recurring jobs being manually
+        # removed (e.g., in the Forbidden handler). One-shot jobs never need it.
+        self.ctx.job.schedule_removal.assert_not_called()
+
+    @pytest.mark.asyncio()
+    async def test_recurring_claude_does_not_deactivate(self):
+        """Recurring Claude jobs (daily/interval) are not deactivated after delivery."""
+        self.ctx.job.data["schedule_type"] = "daily"
+        self.ctx.bot_data = {"pool": _make_claude_mock("Daily report")}
         with (
             patch("kai.cron.log_message"),
             patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate,
@@ -641,3 +680,12 @@ class TestJobCallbackConditionNotMet:
             await _job_callback(self.ctx)
         mock_deactivate.assert_called_once_with(1)
         self.ctx.job.schedule_removal.assert_called_once()
+
+    @pytest.mark.asyncio()
+    async def test_one_shot_condition_not_met_deactivates(self):
+        """One-shot auto-remove jobs deactivate even when condition is not met."""
+        self.ctx.job.data["schedule_type"] = "once"
+        self.ctx.bot_data = {"pool": _make_claude_mock("CONDITION_NOT_MET")}
+        with patch("kai.cron.sessions.deactivate_job", new_callable=AsyncMock) as mock_deactivate:
+            await _job_callback(self.ctx)
+        mock_deactivate.assert_called_once_with(1)

@@ -170,7 +170,7 @@ class Config:
     claude_max_budget_usd: float = 10.0
     claude_max_session_hours: float = 0  # 0 = no limit
     claude_idle_timeout: int = 1800  # seconds before idle subprocess eviction; 0 = no eviction
-    claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "workspace")
+    claude_workspace: Path = field(default_factory=lambda: PROJECT_ROOT / "home")
 
     # Database - uses DATA_DIR so the db lands in the writable data directory
     session_db_path: Path = field(default_factory=lambda: DATA_DIR / "kai.db")
@@ -318,6 +318,19 @@ def _read_protected_yaml(filename: str) -> dict | object | None:
         return _YAML_MALFORMED
 
 
+def _strip_quotes(value: str) -> str:
+    """
+    Remove matched surrounding quotes from a value string.
+
+    Only strips when the first and last characters are the same quote
+    type (' or "). This avoids corrupting values that contain the
+    opposite quote type internally (e.g., 'he said "hello"').
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
     """
     Parse a KEY=VALUE file into a dict.
@@ -326,8 +339,8 @@ def parse_env_file(path: Path) -> dict[str, str]:
     - Lines with KEY=VALUE or KEY="VALUE" or KEY='VALUE'
     - Lines starting with 'export ' (stripped)
     - Comments (lines starting with #) and blank lines (skipped)
-    - Surrounding quotes on values (stripped via str.strip, not matched
-      pairs - same limitation as the main .env parser in load_config)
+    - Surrounding quotes on values (stripped as matched pairs only -
+      inner quotes of the opposite type are preserved)
 
     Same parsing logic as _read_protected_file() uses for /etc/kai/env.
     Re-reads the file each time to pick up changes without restart.
@@ -348,7 +361,7 @@ def parse_env_file(path: Path) -> dict[str, str]:
         # Handle `export KEY=VALUE` lines (common in shell-sourced env files)
         line = line.removeprefix("export ")
         key, _, value = line.partition("=")
-        env[key.strip()] = value.strip().strip("\"'")
+        env[key.strip()] = _strip_quotes(value.strip())
     return env
 
 
@@ -707,7 +720,7 @@ def load_config() -> Config:
                 # Handle `export KEY=VALUE` lines (common in shell-sourced env files)
                 line = line.removeprefix("export ")
                 key, _, value = line.partition("=")
-                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+                os.environ.setdefault(key.strip(), _strip_quotes(value.strip()))
     else:
         load_dotenv(PROJECT_ROOT / ".env")
 
@@ -866,12 +879,21 @@ def load_config() -> Config:
         # No users.yaml and no ALLOWED_USER_IDS - can't start
         raise SystemExit("ALLOWED_USER_IDS is required in .env (or create users.yaml)")
 
+    # Validate CLAUDE_MODEL against the same VALID_MODELS set used
+    # for workspace config. Catches typos at startup instead of
+    # letting them propagate to a confusing runtime failure.
+    claude_model = os.environ.get("CLAUDE_MODEL", "sonnet")
+    if claude_model not in VALID_MODELS:
+        raise SystemExit(
+            f"CLAUDE_MODEL '{claude_model}' is not valid (must be one of: {', '.join(sorted(VALID_MODELS))})"
+        )
+
     return Config(
         telegram_bot_token=token,
         telegram_webhook_url=telegram_webhook_url,
         telegram_webhook_secret=telegram_webhook_secret,
         allowed_user_ids=allowed_ids,
-        claude_model=os.environ.get("CLAUDE_MODEL", "sonnet"),
+        claude_model=claude_model,
         claude_timeout_seconds=claude_timeout_seconds,
         claude_max_budget_usd=claude_max_budget_usd,
         claude_max_session_hours=claude_max_session_hours,

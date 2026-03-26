@@ -56,12 +56,15 @@ _LAUNCHD_LABEL = "com.syrinx.kai"
 # Excludes __pycache__, .pyc, and other build artifacts.
 _SOURCE_EXCLUDES = {"__pycache__", "*.pyc", "*.egg-info", ".git", ".venv", ".env"}
 
-# Excludes for workspace/.claude/ copy. These are runtime-generated or
+# Excludes for home/.claude/ copy. These are runtime-generated or
 # personal data that should not be part of a clean install:
 #   history/    - conversation logs written by history.py at runtime
 #   MEMORY.md   - personal data (gitignored), user creates from .example
 #   skills/     - downloaded skills, environment-specific
-_WORKSPACE_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "skills", "__pycache__"}
+# History and MEMORY.md now live in DATA_DIR, outside the install tree.
+# Both are still excluded because stale files may remain at the source
+# after migration (source files are preserved as backups, not deleted).
+_HOME_CLAUDE_EXCLUDES = {"history", "MEMORY.md", "skills", "__pycache__"}
 
 
 # ── Input helpers ────────────────────────────────────────────────────
@@ -495,22 +498,36 @@ def _copy_tree(src: Path, dst: Path, excludes: set[str] | None = None) -> None:
     """
     Copy a directory tree, excluding patterns like __pycache__.
 
-    Uses shutil.copytree with an ignore function built from the excludes set.
-    If the destination exists, it's removed first to ensure a clean copy.
+    Uses a merge-based approach: walks the source tree and copies each file
+    individually, creating destination directories as needed. Files at the
+    destination that don't exist in the source are left untouched. This is
+    critical for workspace/.claude/ where runtime-created content (skills,
+    Claude Code state files) must survive installs.
+
+    The previous implementation used shutil.rmtree(dst) before copytree(),
+    which destroyed ALL destination contents including runtime data that the
+    excludes were meant to protect. See issue #143.
 
     Args:
         src: Source directory.
-        dst: Destination directory.
+        dst: Destination directory (created if it doesn't exist).
         excludes: Set of glob patterns to exclude (e.g., {"__pycache__", "*.pyc"}).
     """
-    if dst.exists():
-        shutil.rmtree(dst)
+    ignore_fn = shutil.ignore_patterns(*(excludes or set()))
 
-    ignore_fn = None
-    if excludes:
-        ignore_fn = shutil.ignore_patterns(*excludes)
+    for src_dir, dirs, files in os.walk(src):
+        rel = Path(src_dir).relative_to(src)
+        # Check which names should be excluded at this level
+        ignored = set(ignore_fn(str(src_dir), dirs + files))
+        # Filter directories so os.walk doesn't descend into excluded ones
+        dirs[:] = [d for d in dirs if d not in ignored]
 
-    shutil.copytree(src, dst, ignore=ignore_fn)
+        dst_dir = dst / rel
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+        for f in files:
+            if f not in ignored:
+                shutil.copy2(Path(src_dir) / f, dst_dir / f)
 
 
 def _generate_env_file(env: dict[str, str]) -> str:
@@ -859,16 +876,18 @@ def _start_service(platform: str, dry_run: bool, **_kwargs: object) -> None:
     print(f"  Warning: service start failed ({' '.join(cmd[:2])}){hint}")
 
 
-def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
+def _apply_migrate(data_path: Path, install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
     """
     Migrate runtime data from the development directory to the data directory.
 
-    One-time migration of database and log files. Safe to run multiple times:
-    existing files at the destination are never overwritten, and source files
-    are never deleted (they serve as backups).
+    One-time migration of database, log, history, memory, and uploaded files.
+    Safe to run multiple times: existing files at the destination are never
+    overwritten, and source files are never deleted (they serve as backups).
 
     Args:
         data_path: Writable data directory (e.g., /var/lib/kai).
+        install_path: Installation directory (e.g., /opt/kai) for locating
+            uploaded files at the old home/files/ location.
         svc_uid: Numeric UID for file ownership.
         svc_gid: Numeric GID for file ownership.
         dry_run: If True, print actions without executing.
@@ -924,6 +943,90 @@ def _apply_migrate(data_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -
                         print(f"  Copied log: {f.name}")
                 # Set ownership on the entire logs directory
                 _set_ownership(logs_dst, svc_uid, svc_gid, recursive=True)
+
+    # -- History migration --
+    # One-time: copy JSONL conversation logs from the source tree
+    # (home/.claude/history/, pre-DATA_DIR location) to DATA_DIR/history/.
+    # Safe on repeated runs: only copies files that
+    # don't already exist at the destination. Source files are preserved
+    # as backups (same pattern as the database and log migrations above).
+    history_src = PROJECT_ROOT / "home" / ".claude" / "history"
+    history_dst = data_path / "history"
+
+    if history_src.is_dir():
+        copied = 0
+        for f in sorted(history_src.glob("*.jsonl")):
+            dest = history_dst / f.name
+            if dest.exists():
+                continue
+            if dry_run:
+                print(f"[DRY RUN] Would copy history: {f} -> {dest}")
+            else:
+                history_dst.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dest)
+                os.chown(dest, svc_uid, svc_gid)
+                copied += 1
+        if copied and not dry_run:
+            print(f"  Migrated {copied} history file(s) to {history_dst}")
+        elif not copied and not dry_run:
+            print("  History already migrated or no files to copy")
+
+    # -- MEMORY.md migration --
+    # One-time: copy personal memory from the source tree
+    # (home/.claude/MEMORY.md, pre-DATA_DIR location) to DATA_DIR/memory/.
+    # If the file doesn't exist at the source location
+    # (common - it was never created on most installs), _bootstrap_memory()
+    # in main.py handles creation from the example template at startup.
+    memory_src = PROJECT_ROOT / "home" / ".claude" / "MEMORY.md"
+    memory_dst = data_path / "memory" / "MEMORY.md"
+    if memory_src.is_file() and not memory_dst.exists():
+        if dry_run:
+            print(f"[DRY RUN] Would copy MEMORY.md: {memory_src} -> {memory_dst}")
+        else:
+            (data_path / "memory").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(memory_src, memory_dst)
+            os.chown(memory_dst, svc_uid, svc_gid)
+            print(f"  Migrated MEMORY.md to {memory_dst}")
+
+    # -- Uploaded files migration --
+    # One-time: copy user-uploaded files from the install tree
+    # (home/files/, pre-DATA_DIR location) to DATA_DIR/files/.
+    # Walks the full directory tree to handle per-user subdirectories
+    # (files/{user_id}/). Existing files at the destination are not
+    # overwritten. Source files are preserved as backups.
+    files_src = install_path / "home" / "files"
+    files_dst = data_path / "files"
+
+    if files_src.exists() and any(files_src.iterdir()):
+        # Use os.walk with followlinks=False (the default) so symlinks
+        # pointing outside the directory are not followed during migration.
+        copied = 0
+        for root, _dirs, fnames in os.walk(files_src):
+            for fname in fnames:
+                src_file = Path(root) / fname
+                rel = src_file.relative_to(files_src)
+                dst_file = files_dst / rel
+                if dst_file.exists():
+                    continue
+                if dry_run:
+                    print(f"[DRY RUN] Would copy file: {src_file} -> {dst_file}")
+                else:
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+                copied += 1
+        if copied and not dry_run:
+            # Set ownership on the entire files tree, not just newly copied
+            # files. This ensures uniform ownership after a partial migration
+            # (e.g., some files copied on a previous run, new ones added now).
+            for root, _subdirs, fnames in os.walk(files_dst):
+                os.chown(root, svc_uid, svc_gid)
+                for fname in fnames:
+                    os.chown(os.path.join(root, fname), svc_uid, svc_gid)
+            print(f"  Migrated {copied} uploaded file(s) to {files_dst}")
+        elif copied and dry_run:
+            print(f"[DRY RUN] Would migrate {copied} uploaded file(s) to {files_dst}")
+        elif not copied and not dry_run:
+            print("  Uploaded files already migrated or no files to copy")
 
 
 def _cmd_apply() -> None:
@@ -1030,7 +1133,7 @@ def _cmd_apply() -> None:
     _apply_sudoers(service_user, dry_run, claude_user)
 
     # -- Step 7: Migrate runtime data --
-    _apply_migrate(data_path, svc_uid, svc_gid, dry_run)
+    _apply_migrate(data_path, install_path, svc_uid, svc_gid, dry_run)
 
     # -- Step 8: Generate service definition --
     webhook_port = int(env.get("WEBHOOK_PORT", "8080"))
@@ -1076,16 +1179,18 @@ def _apply_directories(
         dry_run: If True, print what would be created without doing it.
         workspace_base: Optional base directory for workspace name resolution.
     """
-    # The workspace dir under the install path must be writable by the service
-    # user so history.py can create .claude/history/ inside it. The rest of
-    # the install tree stays root-owned and read-only.
-    workspace_path = install_path / "workspace"
+    # The home dir under the install path must be writable by the service
+    # user so skills/ and other runtime dirs can be created inside it. The rest
+    # of the install tree stays root-owned and read-only.
+    home_path = install_path / "home"
     dirs: list[tuple[Path, int, int, int]] = [
         (install_path, 0, 0, 0o755),  # root-owned install dir
-        (workspace_path, svc_uid, svc_gid, 0o755),  # user-writable workspace
+        (home_path, svc_uid, svc_gid, 0o755),  # user-writable home workspace
         (data_path, svc_uid, svc_gid, 0o755),  # user-owned data dir
         (data_path / "logs", svc_uid, svc_gid, 0o755),
         (data_path / "files", svc_uid, svc_gid, 0o755),
+        (data_path / "history", svc_uid, svc_gid, 0o755),
+        (data_path / "memory", svc_uid, svc_gid, 0o755),
         (Path("/etc/kai"), 0, 0, 0o755),
     ]
 
@@ -1108,13 +1213,26 @@ def _apply_directories(
 
 
 def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool) -> None:
-    """Copy source tree and workspace config from PROJECT_ROOT to the install location."""
+    """Copy source tree and home config from PROJECT_ROOT to the install location."""
     src_src = PROJECT_ROOT / "src"
     src_dst = install_path / "src"
     pyproject_src = PROJECT_ROOT / "pyproject.toml"
     pyproject_dst = install_path / "pyproject.toml"
-    ws_claude_src = PROJECT_ROOT / "workspace" / ".claude"
-    ws_claude_dst = install_path / "workspace" / ".claude"
+    ws_claude_src = PROJECT_ROOT / "home" / ".claude"
+    ws_claude_dst = install_path / "home" / ".claude"
+
+    # One-time: rename workspace/ to home/ at the install location.
+    # The directory was renamed in the source tree; this migrates the
+    # production install so runtime content (skills, files, notes) is
+    # preserved rather than orphaned.
+    old_ws = install_path / "workspace"
+    new_ws = install_path / "home"
+    if old_ws.is_dir() and not new_ws.exists():
+        if dry_run:
+            print(f"[DRY RUN] Would rename: {old_ws} -> {new_ws}")
+        else:
+            old_ws.rename(new_ws)
+            print(f"  Renamed {old_ws} -> {new_ws}")
 
     if dry_run:
         print(f"[DRY RUN] Would copy: {src_src} -> {src_dst}")
@@ -1131,18 +1249,18 @@ def _apply_source(install_path: Path, svc_uid: int, svc_gid: int, dry_run: bool)
     os.chown(pyproject_dst, 0, 0)
     print(f"  Copied {pyproject_dst}")
 
-    # Copy workspace/.claude/ (bot identity, memory template) excluding
-    # runtime data. Without CLAUDE.md, the bot has no identity in the home
-    # workspace and nothing to inject into foreign workspace sessions.
+    # Copy home/.claude/ (bot identity, memory template) excluding
+    # runtime data. Without CLAUDE.md, the bot has no identity in the
+    # home workspace and nothing to inject into foreign workspace sessions.
     # Files inside are root-owned (read-only config), but the directory
-    # itself is service-user-owned so history.py can create history/ at
-    # runtime.
+    # itself is service-user-owned so skills/ and other runtime dirs can
+    # be created inside it.
     if ws_claude_src.is_dir():
         ws_claude_dst.parent.mkdir(parents=True, exist_ok=True)
-        _copy_tree(ws_claude_src, ws_claude_dst, _WORKSPACE_CLAUDE_EXCLUDES)
+        _copy_tree(ws_claude_src, ws_claude_dst, _HOME_CLAUDE_EXCLUDES)
         _set_ownership(ws_claude_dst, 0, 0, recursive=True)
         os.chown(ws_claude_dst, svc_uid, svc_gid)
-        print(f"  Copied workspace config to {ws_claude_dst}")
+        print(f"  Copied home config to {ws_claude_dst}")
 
 
 def _apply_venv(install_path: Path, is_update: bool, dry_run: bool) -> None:

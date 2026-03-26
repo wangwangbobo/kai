@@ -926,13 +926,20 @@ class TestContextInjection:
         monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
 
     @pytest.fixture()
-    def home_workspace(self, tmp_path):
-        """Create a home workspace with identity and memory files."""
+    def home_workspace(self, tmp_path, monkeypatch):
+        """Create a home workspace with identity file and DATA_DIR memory."""
         home = tmp_path / "home"
         claude_dir = home / ".claude"
         claude_dir.mkdir(parents=True)
         (claude_dir / "CLAUDE.md").write_text("You are Kai.")
-        (claude_dir / "MEMORY.md").write_text("User likes concise responses.")
+
+        # Personal memory now lives under DATA_DIR, not the workspace
+        data_dir = tmp_path / "data"
+        memory_dir = data_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "MEMORY.md").write_text("User likes concise responses.")
+        monkeypatch.setattr("kai.claude.DATA_DIR", data_dir)
+
         return home
 
     @pytest.fixture()
@@ -1112,12 +1119,18 @@ class TestMultiModalPrompt:
         monkeypatch.setattr(PersistentClaude, "_kill", AsyncMock())
 
     @pytest.mark.asyncio
-    async def test_list_prompt_with_context_injection(self, tmp_path):
+    async def test_list_prompt_with_context_injection(self, tmp_path, monkeypatch):
         """List prompts get context prepended as text blocks, content sent as-is."""
         home = tmp_path / "home"
         claude_dir = home / ".claude"
         claude_dir.mkdir(parents=True)
-        (claude_dir / "MEMORY.md").write_text("Some memory")
+
+        # Personal memory lives under DATA_DIR, not the workspace
+        data_dir = tmp_path / "data"
+        memory_dir = data_dir / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "MEMORY.md").write_text("Some memory")
+        monkeypatch.setattr("kai.claude.DATA_DIR", data_dir)
 
         proc = _make_mock_proc([_system_event(), _result_event(), b""])
         claude = _make_claude(
@@ -1224,16 +1237,49 @@ class TestKill:
 
     @pytest.mark.asyncio
     async def test_cancels_stderr_task(self):
-        """_kill cancels the stderr drain task."""
+        """_kill cancels the stderr drain task before clearing proc."""
         claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.send_signal = MagicMock()
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+
         mock_task = MagicMock()
         claude._stderr_task = mock_task
-        claude._proc = None  # No process to kill
 
         await claude._kill()
 
         mock_task.cancel.assert_called_once()
         assert claude._stderr_task is None
+
+    @pytest.mark.asyncio
+    async def test_stderr_cancelled_before_proc_cleared(self):
+        """_kill cancels stderr task while self._proc is still set."""
+        claude = _make_claude()
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.send_signal = MagicMock()
+        mock_proc.wait = AsyncMock()
+        claude._proc = mock_proc
+
+        proc_at_cancel_time: list[object] = []
+
+        def tracking_cancel():
+            # Record whether self._proc is still set when cancel is called
+            proc_at_cancel_time.append(claude._proc)
+
+        mock_task = MagicMock()
+        mock_task.cancel = MagicMock(side_effect=tracking_cancel)
+        claude._stderr_task = mock_task
+
+        await claude._kill()
+
+        # stderr task was cancelled while proc was still set (not None)
+        assert len(proc_at_cancel_time) == 1
+        assert proc_at_cancel_time[0] is mock_proc
+        # After _kill completes, proc is cleared
+        assert claude._proc is None
 
     @pytest.mark.asyncio
     async def test_idempotent_no_process(self):
@@ -1539,6 +1585,25 @@ class TestChangeWorkspace:
 
         assert claude.workspace == new_path
         mock_kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_kill_before_state_mutation(self):
+        """_kill() runs before attributes are mutated, not after."""
+        claude = _make_claude()
+        original_workspace = claude.workspace
+        kill_order: list[tuple[str, Path]] = []
+
+        async def tracking_kill():
+            # Record what workspace was set when _kill was called
+            kill_order.append(("kill", claude.workspace))
+
+        with patch.object(claude, "_kill", side_effect=tracking_kill):
+            await claude.change_workspace(Path("/tmp/new-workspace"))
+
+        # _kill should have seen the ORIGINAL workspace, not the new one
+        assert kill_order == [("kill", original_workspace)]
+        # Final state should still be the new workspace
+        assert claude.workspace == Path("/tmp/new-workspace")
 
 
 # ── restart ──────────────────────────────────────────────────────────
